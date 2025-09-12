@@ -593,7 +593,19 @@ class EncodeTab(QWidget):
                 f"Payload: {payload_bits} bits ({human_bytes(payload_bits//8)})\n"
                 f"Result: {'OK' if ok else 'Too large'}"
             )
-
+    def _capacity_bits_for(self, lsb: int, roi_xywh: tuple[int, int, int, int]) -> int:
+        """Return available embedding capacity in bits for current cover and ROI."""
+        if self.cover_kind == "image":
+            _, _, w, h = roi_xywh
+            channels = self.img_info["bands"]
+            return w * h * channels * lsb
+        elif self.cover_kind == "audio":
+            # roi tuple stored as (start, 0, length, 0)
+            length = roi_xywh[2]
+            channels = self.audio_info["channels"]
+            return length * channels * lsb
+        return 0
+    
     # ---------- Encode (stub) ----------
     def on_encode(self):
         if not self.cover_path:
@@ -627,6 +639,20 @@ class EncodeTab(QWidget):
             length = max(0, min(length, self.audio_info["frames"] - start))
             roi_xywh = (start, 0, length, 0)  # reuse tuple shape for salt/header
 
+        HEADER_BYTES = 84  # matches build_header()
+        header_bits = HEADER_BYTES * 8
+        payload_bits = len(payload_bytes) * 8
+        capacity_bits = self._capacity_bits_for(lsb, roi_xywh)
+        if header_bits + payload_bits > capacity_bits:
+            self.error(
+                "Payload too large for the selected ROI and LSBs.\n\n"
+                f"Capacity: {capacity_bits} bits\n"
+                f"Header:   {header_bits} bits\n"
+                f"Payload:  {payload_bits} bits\n"
+                f"Needed:   {header_bits + payload_bits} bits"
+            )
+            return
+        
         try:
             cover_id = cover_fingerprint(self.cover_path)
             full_salt = canonical_salt(lsb, roi_xywh, cover_id, self.cover_kind or "unknown")
