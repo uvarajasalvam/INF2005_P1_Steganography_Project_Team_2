@@ -1,0 +1,1 @@
+pip install numpy Pillow PySide6 matplotlib
