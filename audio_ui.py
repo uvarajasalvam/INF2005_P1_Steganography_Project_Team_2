@@ -1,4 +1,21 @@
 # audio_ui.py
+# Audio Steganography GUI — Encode & Decode (PySide6)
+# --------------------------------------------------
+# What this does
+# - WAV-only (PCM) steganography using LSB(s) over a selected ROI (start, length)
+# - Keyed permutation and per-byte bit rotation derived via HKDF(passphrase, salt16)
+# - Header-first layout (84 bytes) + raw payload bytes
+# - Final Key token (stg1:...) contains public params so decoder can rebuild
+#
+# Notes
+# - This implements a *self-contained* format (not compatible with steghide).
+# - No payload encryption yet (K_crypto/nonce reserved for future AEAD).
+# - cover_fp16 inside the header is informational here (binds salt during encode);
+#   at decode we don't recompute/compare it because we don't have the pristine cover.
+#
+# Run
+#   python audio_stego_gui.py
+
 import os, math, zlib, hmac, hashlib, struct, base64, wave as wave_mod
 from pathlib import Path
 
@@ -88,10 +105,18 @@ def kdf_from_key(user_key: str, salt: bytes) -> dict:
     nonce    = okm[off:off+12]; off += 12
     return {"K_perm": K_perm, "K_bit": K_bit, "K_crypto": K_crypto, "K_check": K_check, "nonce": nonce}
 
+# -------------------------------
+# Header pack/unpack
+# Header wo CRC = 80 bytes, with CRC = 84 bytes
+HEADER_WO_CRC_LEN = 80
+HEADER_TOTAL_LEN   = 84
+
+HEADER_FMT_PREFIX  = b"STG1"
+
 def build_header(version: int, lsb: int, roi_xywh: tuple[int,int,int,int],
                  payload_len: int, cover_fp16: bytes, salt16: bytes,
                  nonce12: bytes, kcheck4: bytes) -> bytes:
-    magic = b"STG1"; flags = 0; pad = 0
+    magic = HEADER_FMT_PREFIX; flags = 0; pad = 0
     x0, y0, w, h = roi_xywh
     header_wo_crc = (
         magic +
@@ -102,6 +127,37 @@ def build_header(version: int, lsb: int, roi_xywh: tuple[int,int,int,int],
     )
     crc = zlib.crc32(header_wo_crc) & 0xFFFFFFFF
     return header_wo_crc + struct.pack("<I", crc)
+
+class ParsedHeader:
+    __slots__ = ("version","flags","lsb","roi","payload_len","cover_fp16","salt16","nonce12","kcheck4","crc32")
+    def __init__(self, version, flags, lsb, roi, payload_len, cover_fp16, salt16, nonce12, kcheck4, crc32):
+        self.version=version; self.flags=flags; self.lsb=lsb; self.roi=roi; self.payload_len=payload_len
+        self.cover_fp16=cover_fp16; self.salt16=salt16; self.nonce12=nonce12; self.kcheck4=kcheck4; self.crc32=crc32
+
+
+def parse_header(buf: bytes) -> ParsedHeader:
+    if len(buf) != HEADER_TOTAL_LEN:
+        raise ValueError("Header size mismatch")
+    magic = buf[:4]
+    if magic != HEADER_FMT_PREFIX:
+        raise ValueError("Bad header magic")
+    version, flags, lsb, pad = struct.unpack("<BBBB", buf[4:8])
+    x0, y0, w, h = struct.unpack("<IIII", buf[8:24])
+    payload_len, = struct.unpack("<Q", buf[24:32])
+    cover_fp16 = buf[32:48]
+    salt16     = buf[48:64]
+    nonce12    = buf[64:76]
+    kcheck4    = buf[76:80]
+    crc32_read, = struct.unpack("<I", buf[80:84])
+
+    calc = zlib.crc32(buf[:80]) & 0xFFFFFFFF
+    if calc != crc32_read:
+        raise ValueError("Header CRC32 mismatch (corrupted or wrong key/ROI/LSB)")
+
+    return ParsedHeader(version, flags, lsb, (x0,y0,w,h), payload_len, cover_fp16, salt16, nonce12, kcheck4, crc32_read)
+
+# -------------------------------
+# Final Key token helpers
 
 def make_key_token(media_kind: str, lsb: int, roi_xywh: tuple[int,int,int,int], salt16: bytes, kcheck4: bytes) -> str:
     media_code = 0 if media_kind == "image" else 1
@@ -122,6 +178,7 @@ def parse_key_token(token: str) -> dict:
 
 
 # ---------- Widgets ----------
+# Waveform widget (for ROI picking)
 class WaveformView(QWidget):
     selectionChanged = Signal(int, int)  # (start_sample, length)
 
@@ -158,18 +215,16 @@ class WaveformView(QWidget):
         self._rate = int(rate)
         n = len(samples_mono)
         if n == 0:
-            self.clear()
+            self.clear(); 
             return
-
         step = max(1, n // 200_000)
         y = samples_mono[::step].astype(np.float32)
         maxv = float(np.max(np.abs(y))) if y.size else 1.0
         if maxv <= 0: maxv = 1.0
         y = y / maxv
         x = (np.arange(len(y)) * step) / self._rate
-
         self._x, self._y = x, y
-        self.ax.clear()
+        self.ax.clear(); 
         self._pretty_axes()
         self.ax.plot(self._x, self._y, linewidth=1.25)
         self.ax.set_xlim(float(self._x[0]), float(self._x[-1]))
@@ -202,7 +257,7 @@ class WaveformView(QWidget):
 
     def _on_release(self, ev):
         if self._press_sample is None or ev.inaxes != self.ax:
-            self._press_sample = None
+            self._press_sample = None; 
             return
         cur_sample = int(max(0.0, ev.xdata) * self._rate)
         s0 = max(0, min(self._press_sample, cur_sample))
@@ -212,7 +267,7 @@ class WaveformView(QWidget):
 
     def _draw_span(self, t0: float, t1: float):
         self._remove_span()
-        if t1 <= t0:
+        if t1 <= t0: 
             return
         self._span = self.ax.axvspan(t0, t1, alpha=0.25, color="#1DB954")
         self.canvas.draw_idle()
@@ -224,13 +279,14 @@ class WaveformView(QWidget):
             self._span = None
 
     def clear(self):
-        self.ax.clear()
-        self._pretty_axes()
+        self.ax.clear(); 
+        self._pretty_axes(); 
         self.canvas.draw_idle()
-        self._x = self._y = None
+        self._x = self._y = None; 
         self._remove_span()
 
-
+# -------------------------------
+# DropLabel (drag & drop picker)
 class DropLabel(QLabel):
     fileDropped = Signal(str)
     def __init__(self, title: str, exts: set[str] | None, parent=None):
@@ -240,11 +296,13 @@ class DropLabel(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.setText(f"Drop {title} here\n—or—\nClick to browse")
         self.setObjectName("DropLabel")
-        self.setStyleSheet("""
+        self.setStyleSheet(
+            """
             #DropLabel { border: 2px dashed #888; border-radius: 12px; padding: 16px;
                          color: #444; font-size: 14px; background: #fafafa; }
             #DropLabel:hover { background: #f0f7ff; }
-        """)
+            """
+        )
 
     def dragEnterEvent(self, e: QtGui.QDragEnterEvent):
         if e.mimeData().hasUrls():
@@ -275,7 +333,8 @@ class DropLabel(QLabel):
             return True
         return Path(path).suffix.lower() in self.exts
 
-
+# -------------------------------
+# Payload panel (text/file)
 class PayloadPanel(QWidget):
     def __init__(self, on_changed):
         super().__init__()
@@ -283,7 +342,7 @@ class PayloadPanel(QWidget):
         box = QVBoxLayout(self)
         self.tabs = QTabWidget()
         # Text
-        self.text_edit = QTextEdit()
+        self.text_edit = QTextEdit(); 
         self.text_edit.setPlaceholderText("Type or paste text payload here…")
         self.text_info = QLabel("Text bytes: 0")
         self.text_edit.textChanged.connect(self._text_changed)
@@ -333,6 +392,7 @@ class PayloadPanel(QWidget):
 
 
 # ---------- AUDIO ENCODE ----------
+# Encode tab
 class AudioEncodeTab(QWidget):
     def __init__(self):
         super().__init__()
@@ -369,11 +429,10 @@ class AudioEncodeTab(QWidget):
         self.audio_start.valueChanged.connect(self._start_changed)
         self.audio_len.valueChanged.connect(self.update_capacity_label)
 
-        # Seconds controls (friendly)
+        # Friendly seconds controls
         self.start_sec = QDoubleSpinBox(); self.start_sec.setDecimals(3)
         self.start_sec.setRange(0.0, 0.0); self.start_sec.setSingleStep(0.010)
         self.start_sec.setSuffix(" s"); self.start_sec.valueChanged.connect(self._start_sec_changed)
-
         self.len_sec = QDoubleSpinBox(); self.len_sec.setDecimals(3)
         self.len_sec.setRange(0.001, 0.001); self.len_sec.setSingleStep(0.010)
         self.len_sec.setSuffix(" s"); self.len_sec.valueChanged.connect(self._len_sec_changed)
@@ -386,7 +445,7 @@ class AudioEncodeTab(QWidget):
         form.addRow("Length (seconds):", self.len_sec)
         ctrl.setLayout(form)
 
-        # Timestamp scrubber (Spotify-ish)
+        # Timestamp scrubber
         ts_box = QGroupBox("Timestamp (slide to choose start)")
         tsv = QVBoxLayout()
         row = QHBoxLayout()
@@ -395,24 +454,18 @@ class AudioEncodeTab(QWidget):
         self.lbl_time_right = QLabel("0:00")
         self.lbl_time_cur.setAlignment(Qt.AlignCenter)
         self.lbl_time_cur.setStyleSheet("font-weight:600;")
-        row.addWidget(self.lbl_time_left, 0)
-        row.addWidget(self.lbl_time_cur, 1)
-        row.addWidget(self.lbl_time_right, 0)
+        row.addWidget(self.lbl_time_left, 0); row.addWidget(self.lbl_time_cur, 1); row.addWidget(self.lbl_time_right, 0)
         tsv.addLayout(row)
-
         self.time_slider = QSlider(Qt.Horizontal)
-        self.time_slider.setRange(0, 0)
-        self.time_slider.setSingleStep(1)
-        self.time_slider.setPageStep(44100)
-        self.time_slider.setStyleSheet("""
+        self.time_slider.setRange(0, 0); self.time_slider.setSingleStep(1); self.time_slider.setPageStep(44100)
+        self.time_slider.setStyleSheet(
+            """
             QSlider::groove:horizontal { height: 6px; background: #3a3a3a; border-radius: 3px; }
             QSlider::sub-page:horizontal { background: #1DB954; height: 6px; border-radius: 3px; }
             QSlider::add-page:horizontal { background: #3a3a3a; height: 6px; border-radius: 3px; }
-            QSlider::handle:horizontal {
-                background: #ffffff; border: 1px solid #1DB954; width: 14px; height: 14px;
-                margin: -6px 0; border-radius: 7px;
-            }
-        """)
+            QSlider::handle:horizontal { background: #ffffff; border: 1px solid #1DB954; width: 14px; height: 14px; margin: -6px 0; border-radius: 7px; }
+            """
+        )
         self.time_slider.valueChanged.connect(self._time_slider_changed)
         tsv.addWidget(self.time_slider)
         ts_box.setLayout(tsv)
@@ -429,7 +482,7 @@ class AudioEncodeTab(QWidget):
         key_box.setLayout(key_h)
 
         btns = QHBoxLayout()
-        self.encode_btn = QPushButton("Derive Key & Encode (Placeholder)")
+        self.encode_btn = QPushButton("Encode")
         self.encode_btn.clicked.connect(self.on_encode)
         btns.addWidget(self.encode_btn)
 
@@ -440,18 +493,14 @@ class AudioEncodeTab(QWidget):
         # RIGHT: waveform + log
         right = QVBoxLayout()
         wf_box = QGroupBox("Waveform (click–drag to select ROI)")
-        wf_v = QVBoxLayout()
-        self.wave = WaveformView()
-        self.wave.selectionChanged.connect(self._on_wave_selection)
-        wf_v.addWidget(self.wave)
-        wf_box.setLayout(wf_v)
+        wf_v = QVBoxLayout(); self.wave = WaveformView(); self.wave.selectionChanged.connect(self._on_wave_selection)
+        wf_v.addWidget(self.wave); wf_box.setLayout(wf_v)
 
         log_box = QGroupBox("Log")
         self.log_edit = QTextEdit(); self.log_edit.setReadOnly(True)
         lv = QVBoxLayout(); lv.addWidget(self.log_edit); log_box.setLayout(lv)
 
-        right.addWidget(wf_box)
-        right.addWidget(log_box)
+        right.addWidget(wf_box); right.addWidget(log_box)
 
         splitter = QSplitter()
         lw = QWidget(); lw.setLayout(left)
@@ -463,6 +512,7 @@ class AudioEncodeTab(QWidget):
         QtGui.QGuiApplication.clipboard().setText(self.key_token_edit.text())
         QMessageBox.information(self, "Copied", "Final Key copied to clipboard.")
 
+    # ----- WAV helpers
     def _read_wav_mono(self, path: str):
         with wave_mod.open(path, "rb") as wf:
             n_channels = wf.getnchannels()
@@ -470,77 +520,121 @@ class AudioEncodeTab(QWidget):
             framerate = wf.getframerate()
             n_frames  = wf.getnframes()
             raw = wf.readframes(n_frames)
-
-        if sampwidth == 1:  # 8-bit unsigned
-            a = np.frombuffer(raw, dtype=np.uint8).astype(np.int16)
-            a = (a - 128) << 8
-        elif sampwidth == 2:  # 16-bit signed
+        if sampwidth == 1:
+            a = np.frombuffer(raw, dtype=np.uint8).astype(np.int16); a = (a - 128) << 8
+        elif sampwidth == 2:
             a = np.frombuffer(raw, dtype=np.int16)
-        elif sampwidth == 3:  # 24-bit packed
+        elif sampwidth == 3:
             b = np.frombuffer(raw, dtype=np.uint8)
             if len(b) % 3 != 0: b = b[: (len(b)//3)*3]
             b = b.reshape(-1, 3)
-            a = (b[:,0].astype(np.int32) |
-                 (b[:,1].astype(np.int32) << 8) |
-                 (b[:,2].astype(np.int32) << 16))
-            mask = 1 << 23
-            a = (a ^ mask) - mask  # sign extend
-        elif sampwidth == 4:  # 32-bit signed
+            a = (b[:,0].astype(np.int32) | (b[:,1].astype(np.int32) << 8) | (b[:,2].astype(np.int32) << 16))
+            mask = 1 << 23; a = (a ^ mask) - mask
+        elif sampwidth == 4:
             a = np.frombuffer(raw, dtype=np.int32)
         else:
             raise ValueError(f"Unsupported sample width: {sampwidth*8}-bit")
-
         if n_channels > 1:
             a = a.reshape(-1, n_channels).mean(axis=1).astype(a.dtype)
-
         info = {"frames": n_frames, "channels": n_channels, "sampwidth": sampwidth, "rate": framerate}
         return a, framerate, info
 
+    def _read_wav_bytes(self, path: str):
+        with wave_mod.open(path, "rb") as wf:
+            n_channels = wf.getnchannels()
+            sampwidth  = wf.getsampwidth()
+            framerate  = wf.getframerate()
+            n_frames   = wf.getnframes()
+            raw = wf.readframes(n_frames)
+        raw_u8 = np.frombuffer(raw, dtype=np.uint8).copy()
+        params = {"channels": n_channels, "sampwidth": sampwidth, "rate": framerate, "frames": n_frames}
+        return raw_u8, params
+
+    def _write_wav_bytes(self, out_path: str, params: dict, raw_u8: np.ndarray):
+        with wave_mod.open(out_path, "wb") as wf:
+            wf.setnchannels(params["channels"]) ; wf.setsampwidth(params["sampwidth"]) ; wf.setframerate(params["rate"]) ; wf.writeframes(raw_u8.tobytes())
+
+    # ----- Target indices (LSB byte per sample across channels)
+    def _target_byte_indices(self, params: dict, start_frame: int, length_frames: int) -> np.ndarray:
+        C = params["channels"]; B = params["sampwidth"]; F = length_frames
+        bytes_per_frame = C * B
+        base = start_frame * bytes_per_frame
+        idx = np.empty(F * C, dtype=np.int64)
+        k = 0
+        for i in range(F):
+            frame_base = base + i * bytes_per_frame
+            for c in range(C):
+                idx[k] = frame_base + c * B
+                k += 1
+        return idx
+
+    # ----- Bit helpers
+    def _bit_chunks(self, data: bytes, lsb: int):
+        cur = []
+        for byte in data:
+            for bitpos in range(7, -1, -1):
+                cur.append((byte >> bitpos) & 1)
+                if len(cur) == lsb:
+                    yield cur; cur = []
+        if cur:
+            while len(cur) < lsb: cur.append(0)
+            yield cur
+
+    def _rotate_bits(self, bits: list[int], lsb: int, kbit_byte: int) -> int:
+        if lsb <= 0: return 0
+        off = (kbit_byte % lsb)
+        if off: bits = bits[off:] + bits[:off]
+        val = 0
+        for b in bits: val = (val << 1) | (b & 1)
+        return val
+
+    def _embed_bits_into_bytes(self, raw_u8, target_idx, bit_groups_iter, lsb, kbit_byte):
+        mask = (1 << lsb) - 1
+        mask_u8    = np.uint8(mask)
+        invmask_u8 = np.uint8(~mask_u8)
+        n_targets = len(target_idx)
+        for i in range(n_targets):
+            try:
+                bits = next(bit_groups_iter)
+            except StopIteration:
+                break
+            v = self._rotate_bits(bits, lsb, kbit_byte)
+            j = target_idx[i]
+            base = np.uint8(raw_u8[j]) & invmask_u8
+            raw_u8[j] = np.uint8(base | np.uint8(v))
+
+    # ----- GUI reactions
     def load_cover(self, path: str):
         try:
             ext = Path(path).suffix.lower()
             if ext not in AUDIO_EXTS: raise ValueError("Unsupported audio format.")
             self.cover_path = path
-
             samples_mono, rate, info = self._read_wav_mono(path)
             self.audio_info = info
             self.cover_info.setText(
-                f"Path: {path}\nWAV {info['channels']}ch @ {info['rate']}Hz, "
-                f"{info['sampwidth']*8}-bit, frames={info['frames']}"
+                f"Path: {path}\nWAV {info['channels']}ch @ {info['rate']}Hz, {info['sampwidth']*8}-bit, frames={info['frames']}"
             )
-
-            # Sample spinboxes
             self.audio_start.blockSignals(True); self.audio_len.blockSignals(True)
             self.audio_start.setRange(0, max(0, info["frames"]-1)); self.audio_start.setValue(0)
             self.audio_len.setRange(1, info["frames"]); self.audio_len.setValue(info["frames"])
             self.audio_start.blockSignals(False); self.audio_len.blockSignals(False)
-
-            # Seconds controls
             total_dur = info["frames"] / info["rate"] if info["rate"] > 0 else 0.0
             min_dur = 1.0 / info["rate"] if info["rate"] > 0 else 0.001
             self.start_sec.blockSignals(True); self.len_sec.blockSignals(True)
             self.start_sec.setRange(0.0, max(0.0, total_dur))
             self.len_sec.setRange(min_dur, max(min_dur, total_dur))
-            self.start_sec.setValue(0.0)
-            self.len_sec.setValue(max(min_dur, total_dur))
+            self.start_sec.setValue(0.0); self.len_sec.setValue(max(min_dur, total_dur))
             self.start_sec.blockSignals(False); self.len_sec.blockSignals(False)
-
-            # Timestamp slider
             self.time_slider.blockSignals(True)
             self.time_slider.setRange(0, max(0, info["frames"]-1))
-            self.time_slider.setPageStep(max(1, info["rate"]))  # ~1s
+            self.time_slider.setPageStep(max(1, info["rate"]))
             self.time_slider.setValue(0)
             self.time_slider.blockSignals(False)
-            self.lbl_time_left.setText("0:00")
-            self.lbl_time_right.setText(fmt_time(info["frames"], info["rate"]))
+            self.lbl_time_left.setText("0:00"); self.lbl_time_right.setText(fmt_time(info["frames"], info["rate"]))
             self.lbl_time_cur.setText("0:00")
-
-            # Waveform
             self.wave.set_audio(samples_mono, rate)
             self.wave.set_selection(self.audio_start.value(), self.audio_len.value())
-
-            self.update_capacity_label()
-            self.log(f"Loaded audio: {path}")
+            self.update_capacity_label(); self.log(f"Loaded audio: {path}")
         except Exception as e:
             self.error(str(e))
 
@@ -548,13 +642,9 @@ class AudioEncodeTab(QWidget):
         if self.audio_info:
             max_len = max(1, self.audio_info["frames"] - start_sample)
             length = max(1, min(length, max_len))
-        self.audio_start.blockSignals(True)
-        self.audio_len.blockSignals(True)
-        self.audio_start.setValue(start_sample)
-        self.audio_len.setValue(length)
-        self.audio_start.blockSignals(False)
-        self.audio_len.blockSignals(False)
-        # Sync seconds boxes
+        self.audio_start.blockSignals(True); self.audio_len.blockSignals(True)
+        self.audio_start.setValue(start_sample); self.audio_len.setValue(length)
+        self.audio_start.blockSignals(False); self.audio_len.blockSignals(False)
         if self.audio_info:
             rate = self.audio_info["rate"]
             self.start_sec.blockSignals(True); self.len_sec.blockSignals(True)
@@ -563,38 +653,26 @@ class AudioEncodeTab(QWidget):
             max_len_sec = (self.audio_info["frames"] - start_sample) / rate
             self.len_sec.setMaximum(max_len_sec if max_len_sec > 0 else self.len_sec.minimum())
             self.start_sec.blockSignals(False); self.len_sec.blockSignals(False)
-        # Keep slider in sync
-        self._set_time_slider(start_sample)
-        self.update_capacity_label()
+        self._set_time_slider(start_sample); self.update_capacity_label()
 
     def _set_time_slider(self, start_sample: int):
-        self.time_slider.blockSignals(True)
-        self.time_slider.setValue(start_sample)
-        self.time_slider.blockSignals(False)
-        if self.audio_info:
-            self.lbl_time_cur.setText(fmt_time(start_sample, self.audio_info["rate"]))
+        self.time_slider.blockSignals(True); self.time_slider.setValue(start_sample); self.time_slider.blockSignals(False)
+        if self.audio_info: self.lbl_time_cur.setText(fmt_time(start_sample, self.audio_info["rate"]))
 
     def _time_slider_changed(self, val: int):
-        if not self.audio_info:
-            return
+        if not self.audio_info: return
         self.lbl_time_cur.setText(fmt_time(val, self.audio_info["rate"]))
-        self.audio_start.blockSignals(True)
-        self.audio_start.setValue(val)
-        self.audio_start.blockSignals(False)
-        # reflect in seconds box
+        self.audio_start.blockSignals(True); self.audio_start.setValue(val); self.audio_start.blockSignals(False)
         rate = self.audio_info["rate"]
         self.start_sec.blockSignals(True); self.start_sec.setValue(val / rate); self.start_sec.blockSignals(False)
-        self.wave.set_selection(self.audio_start.value(), self.audio_len.value())
-        self.update_capacity_label()
+        self.wave.set_selection(self.audio_start.value(), self.audio_len.value()); self.update_capacity_label()
 
     def _start_changed(self, start_val: int):
         if self.audio_info:
             max_len = max(1, self.audio_info["frames"] - start_val)
             self.audio_len.setMaximum(max_len)
-        # reflect on waveform + scrubber
         self.wave.set_selection(self.audio_start.value(), self.audio_len.value())
         self._set_time_slider(self.audio_start.value())
-        # Sync seconds boxes
         if self.audio_info:
             rate = self.audio_info["rate"]
             self.start_sec.blockSignals(True); self.len_sec.blockSignals(True)
@@ -605,7 +683,6 @@ class AudioEncodeTab(QWidget):
             self.start_sec.blockSignals(False); self.len_sec.blockSignals(False)
         self.update_capacity_label()
 
-    # Seconds handlers
     def _start_sec_changed(self, s: float):
         if not self.audio_info: return
         rate = self.audio_info["rate"]; total = self.audio_info["frames"]
@@ -616,9 +693,7 @@ class AudioEncodeTab(QWidget):
         self._set_time_slider(start_f)
         self.wave.set_selection(start_f, len_f)
         max_len_sec = (total - start_f) / rate
-        self.len_sec.blockSignals(True)
-        self.len_sec.setMaximum(max_len_sec if max_len_sec > 0 else self.len_sec.minimum())
-        self.len_sec.blockSignals(False)
+        self.len_sec.blockSignals(True); self.len_sec.setMaximum(max_len_sec if max_len_sec > 0 else self.len_sec.minimum()); self.len_sec.blockSignals(False)
         self.update_capacity_label()
 
     def _len_sec_changed(self, d: float):
@@ -626,8 +701,7 @@ class AudioEncodeTab(QWidget):
         rate = self.audio_info["rate"]; total = self.audio_info["frames"]
         start_f, len_f = secs_to_frames(self.start_sec.value(), d, rate, total)
         self.audio_len.blockSignals(True); self.audio_len.setValue(len_f); self.audio_len.blockSignals(False)
-        self.wave.set_selection(start_f, len_f)
-        self.update_capacity_label()
+        self.wave.set_selection(start_f, len_f); self.update_capacity_label()
 
     def current_lsb(self) -> int:
         return self.lsb_slider.value()
@@ -635,26 +709,19 @@ class AudioEncodeTab(QWidget):
     def update_capacity_label(self):
         if not self.cover_path or not self.audio_info:
             self.cap_label.setText("Load WAV + set ROI + add payload."); return
-        lsb = self.current_lsb()
-        start = self.audio_start.value()
-        length = self.audio_len.value()
+        lsb = self.current_lsb(); start = self.audio_start.value(); length = self.audio_len.value()
         length = max(1, min(length, self.audio_info["frames"] - start))
         channels = self.audio_info["channels"]
         capacity_bits = length * channels * lsb
         payload_bits = self.payload_panel.payload_bits()
         if payload_bits is None:
             self.cap_label.setText(
-                f"ROI capacity ≈ {capacity_bits} bits\n"
-                f"Start {self.start_sec.value():.3f}s, Length {self.len_sec.value():.3f}s\n"
-                f"Add payload (Text or File)."
+                f"ROI capacity ≈ {capacity_bits} bits\nStart {self.start_sec.value():.3f}s, Length {self.len_sec.value():.3f}s\nAdd payload (Text or File)."
             )
         else:
             ok = payload_bits <= capacity_bits
             self.cap_label.setText(
-                f"ROI capacity ≈ {capacity_bits} bits\n"
-                f"Start {self.start_sec.value():.3f}s, Length {self.len_sec.value():.3f}s\n"
-                f"Payload: {payload_bits} bits ({human_bytes(payload_bits//8)})\n"
-                f"Result: {'OK' if ok else 'Too large'}"
+                f"ROI capacity ≈ {capacity_bits} bits\nStart {self.start_sec.value():.3f}s, Length {self.len_sec.value():.3f}s\nPayload: {payload_bits} bits ({human_bytes(payload_bits//8)})\nResult: {'OK' if ok else 'Too large'}"
             )
 
     def on_encode(self):
@@ -667,27 +734,35 @@ class AudioEncodeTab(QWidget):
         if not key:
             self.error("Key is required."); return
         try:
-            lsb = self.current_lsb()
-            start = self.audio_start.value()
-            length = self.audio_len.value()
+            lsb = self.current_lsb(); start = self.audio_start.value(); length = self.audio_len.value()
             length = max(1, min(length, self.audio_info["frames"] - start))
             roi = (start, 0, length, 0)
-
             cover_id = cover_fingerprint(self.cover_path)
-            full_salt = canonical_salt(lsb, roi, cover_id, "audio")
-            salt16 = full_salt[:16]
+            full_salt = canonical_salt(lsb, roi, cover_id, "audio"); salt16 = full_salt[:16]
             kd = kdf_from_key(key, salt16)
             K_perm, K_bit, K_crypto, K_check, nonce = kd["K_perm"], kd["K_bit"], kd["K_crypto"], kd["K_check"], kd["nonce"]
-
             header = build_header(1, lsb, roi, len(payload), cover_id, salt16, nonce, K_check)
-            token = make_key_token("audio", lsb, roi, salt16, K_check)
-            self.key_token_edit.setText(token)
-
-            # TODO: embed into PCM samples
+            token = make_key_token("audio", lsb, roi, salt16, K_check); self.key_token_edit.setText(token)
+            raw_u8, params = self._read_wav_bytes(self.cover_path)
+            tgt = self._target_byte_indices(params, start, length)
+            total_bits = (len(header) + len(payload)) * 8
+            capacity_bits = len(tgt) * lsb
+            if total_bits > capacity_bits:
+                self.error(f"Not enough capacity in ROI.\nNeed {total_bits} bits, have {capacity_bits} bits."); return
+            rng_seed = int.from_bytes(K_perm, "little", signed=False)
+            rng = Generator(PCG64(rng_seed))
+            perm = rng.permutation(len(tgt)); tgt_perm = tgt[perm]
+            bit_groups = self._bit_chunks(header + payload, lsb)
+            kbit_byte = K_bit[0]
+            self._embed_bits_into_bytes(raw_u8, tgt_perm, bit_groups, lsb, kbit_byte)
+            stem = Path(self.cover_path).with_suffix("")
+            out_path = str(stem) + "_stego.wav"
+            self._write_wav_bytes(out_path, params, raw_u8)
             self.log(f"Derived token: {token}")
             self.log(f"Header bytes={len(header)} salt16={salt16.hex()} bit_rot={K_bit[0]%lsb} order_seed={int.from_bytes(K_perm,'little')}")
-            QMessageBox.information(self, "Encode (Placeholder)",
-                "Final Key generated. Copy it and keep it for decoding.\nEmbedding not implemented in this stub.")
+            self.log(f"Embedded {total_bits} bits into {len(tgt)} target bytes @ {lsb} LSB(s).")
+            self.log(f"Saved stego WAV: {out_path}")
+            QMessageBox.information(self, "Encode complete", f"Stego written:\n{out_path}\n\nCopy the Final Key for decoding.")
         except Exception as e:
             self.error(str(e))
 
@@ -695,24 +770,21 @@ class AudioEncodeTab(QWidget):
         self.log_edit.append(msg)
 
     def error(self, msg: str):
-        QMessageBox.critical(self, "Error", msg)
-        self.log(f"[ERROR] {msg}")
+        QMessageBox.critical(self, "Error", msg); self.log(f"[ERROR] {msg}")
 
-
-# ---------- AUDIO DECODE ----------
+# -------------------------------
+# Decode tab
 class AudioDecodeTab(QWidget):
     def __init__(self):
         super().__init__()
         self.stego_path: str | None = None
-
         root = QVBoxLayout(self)
         media_box = QGroupBox("Stego Audio (WAV)")
         mv = QVBoxLayout()
         self.stego_drop = DropLabel("a stego WAV", AUDIO_EXTS)
         self.stego_drop.fileDropped.connect(self.load_stego)
         self.media_info = QLabel("No stego WAV loaded"); self.media_info.setWordWrap(True)
-        mv.addWidget(self.stego_drop); mv.addWidget(self.media_info)
-        media_box.setLayout(mv)
+        mv.addWidget(self.stego_drop); mv.addWidget(self.media_info); media_box.setLayout(mv)
 
         ctrl = QGroupBox("Controls")
         form = QFormLayout()
@@ -723,8 +795,8 @@ class AudioDecodeTab(QWidget):
         ctrl.setLayout(form)
 
         btns = QHBoxLayout()
-        self.inspect_btn = QPushButton("Inspect Header (Placeholder)")
-        self.decode_btn  = QPushButton("Decode Payload (Placeholder)")
+        self.inspect_btn = QPushButton("Inspect Header")
+        self.decode_btn  = QPushButton("Decode Payload")
         self.inspect_btn.clicked.connect(self.on_inspect)
         self.decode_btn.clicked.connect(self.on_decode)
         btns.addWidget(self.inspect_btn); btns.addWidget(self.decode_btn)
@@ -735,40 +807,178 @@ class AudioDecodeTab(QWidget):
 
         root.addWidget(media_box); root.addWidget(ctrl); root.addLayout(btns); root.addWidget(log_box)
 
+    # ---- WAV helpers (decode side)
+    def _read_wav_bytes(self, path: str):
+        with wave_mod.open(path, "rb") as wf:
+            n_channels = wf.getnchannels(); sampwidth = wf.getsampwidth(); framerate = wf.getframerate(); n_frames = wf.getnframes(); raw = wf.readframes(n_frames)
+        raw_u8 = np.frombuffer(raw, dtype=np.uint8).copy()
+        params = {"channels": n_channels, "sampwidth": sampwidth, "rate": framerate, "frames": n_frames}
+        return raw_u8, params
+
+    def _target_byte_indices(self, params: dict, start_frame: int, length_frames: int) -> np.ndarray:
+        C = params["channels"]; B = params["sampwidth"]; F = length_frames
+        bytes_per_frame = C * B
+        base = start_frame * bytes_per_frame
+        idx = np.empty(F * C, dtype=np.int64)
+        k = 0
+        for i in range(F):
+            frame_base = base + i * bytes_per_frame
+            for c in range(C):
+                idx[k] = frame_base + c * B; k += 1
+        return idx
+
+    # ---- Extraction helpers
+    @staticmethod
+    def _bits_from_byte(value_u8: int, lsb: int) -> list[int]:
+        # returns lsb bits MSB-first inside the field
+        field = value_u8 & ((1 << lsb) - 1)
+        out = []
+        for i in range(lsb-1, -1, -1):
+            out.append((field >> i) & 1)
+        return out
+
+    @staticmethod
+    def _rotate_right(bits: list[int], lsb: int, off: int) -> list[int]:
+        if lsb <= 0: return bits
+        r = off % lsb
+        if r == 0: return bits
+        # left-rotate by k during encode -> right-rotate by k during decode
+        return bits[-r:] + bits[:-r]
+
+    @staticmethod
+    def _bits_to_bytes(msb_bits: list[int]) -> bytes:
+        # consume groups of 8 (pad final with zeros)
+        out = bytearray()
+        i = 0
+        n = len(msb_bits)
+        while i < n:
+            val = 0
+            for j in range(8):
+                val = (val << 1) | (msb_bits[i+j] if (i+j) < n else 0)
+            out.append(val)
+            i += 8
+        return bytes(out)
+
     def load_stego(self, path: str):
         try:
             ext = Path(path).suffix.lower()
             if ext not in AUDIO_EXTS: raise ValueError("Unsupported audio format.")
             with wave_mod.open(path, "rb") as wf:
-                n_channels = wf.getnchannels()
-                sampwidth = wf.getsampwidth()
-                framerate = wf.getframerate()
-                n_frames  = wf.getnframes()
+                n_channels = wf.getnchannels(); sampwidth = wf.getsampwidth(); framerate = wf.getframerate(); n_frames  = wf.getnframes()
             self.stego_path = path
             self.media_info.setText(f"Path: {path}\nWAV {n_channels}ch @ {framerate}Hz, {sampwidth*8}-bit, frames={n_frames}")
             self.log(f"Loaded stego WAV: {path}")
         except Exception as e:
             self.error(str(e))
 
+    def _extract_bits(self, raw_u8, tgt_indices, total_bits_needed, lsb, kbit_byte):
+        """Extracts total_bits_needed bits in the *same permuted order* used by encode."""
+        bits_out = []
+        rotate = kbit_byte % lsb if lsb > 0 else 0
+        for j in tgt_indices:
+            field_bits = self._bits_from_byte(int(raw_u8[j]), lsb)
+            # undo the left-rotation from encode
+            if rotate:
+                field_bits = self._rotate_right(field_bits, lsb, rotate)
+            bits_out.extend(field_bits)
+            if len(bits_out) >= total_bits_needed:
+                return bits_out[:total_bits_needed]
+        return bits_out
+
+    def _rebuild_indices_perm(self, params, roi, K_perm):
+        x0, _, w, _ = roi
+        tgt = self._target_byte_indices(params, x0, w)
+        rng_seed = int.from_bytes(K_perm, "little", signed=False)
+        rng = Generator(PCG64(rng_seed))
+        perm = rng.permutation(len(tgt))
+        return tgt[perm]
+
+    def _derive_keys_from_token(self, token: str, user_key: str):
+        info = parse_key_token(token)
+        kd = kdf_from_key(user_key, info["salt16"])  # HKDF(pass, salt16)
+        # NEW: compare token's kcheck4 with derived K_check before any extraction
+        if info["kcheck4"] != kd["K_check"]:
+            raise ValueError("Wrong passphrase or tampered Final Key (K_check mismatch)")
+        return info, kd
+
     def on_inspect(self):
         if not self.stego_path:
             self.error("Load a stego WAV first."); return
-        QMessageBox.information(self, "Inspect (Placeholder)",
-            "Read embedded header bits using the same permutation/LSB plane.\nUse parse_header() once you reconstruct the header bytes.")
+        token = self.key_token_edit.text().strip(); user_key = self.user_key_edit.text().strip()
+        if not token or not user_key:
+            self.error("Provide both Final Key token and the user key."); return
+        try:
+            info, kd = self._derive_keys_from_token(token, user_key)
+            raw_u8, params = self._read_wav_bytes(self.stego_path)
+            lsb = info["lsb"]; roi = info["roi"]; K_perm = kd["K_perm"]; K_bit = kd["K_bit"]; K_check = kd["K_check"]
+            # capacity sanity for header
+            tgt_perm = self._rebuild_indices_perm(params, roi, K_perm)
+            capacity_bits = len(tgt_perm) * lsb
+            if capacity_bits < HEADER_TOTAL_LEN*8:
+                raise ValueError("ROI too small to contain header")
+            # Extract header
+            header_bits = self._extract_bits(raw_u8, tgt_perm, HEADER_TOTAL_LEN*8, lsb, K_bit[0])
+            header_bytes = self._bits_to_bytes(header_bits)
+            ph = parse_header(header_bytes)
+            # quick key check
+            if ph.kcheck4 != K_check:
+                raise ValueError("Wrong key/token (K_check mismatch)")
+            # consistency with token
+            ok_ctx = (ph.lsb == lsb and ph.roi == roi)
+            self.log(f"Header OK: version={ph.version} payload_len={ph.payload_len} lsb={ph.lsb} roi={ph.roi} salt16={ph.salt16.hex()} crc32=0x{ph.crc32:08x}")
+            self.log("Context matches token: " + ("YES" if ok_ctx else "NO (mismatch)"))
+            QMessageBox.information(self, "Inspect", "Header parsed successfully. See log for details.")
+        except Exception as e:
+            self.error(str(e))
 
     def on_decode(self):
         if not self.stego_path:
             self.error("Load a stego WAV first."); return
-        token = self.key_token_edit.text().strip()
-        user_key = self.user_key_edit.text().strip()
+        token = self.key_token_edit.text().strip(); user_key = self.user_key_edit.text().strip()
         if not token or not user_key:
             self.error("Provide both Final Key token and the user key."); return
         try:
-            info = parse_key_token(token)
-            kd = kdf_from_key(user_key, info["salt16"])
-            self.log(f"Parsed token: media={info['media_kind']} lsb={info['lsb']} roi={info['roi']} salt16={info['salt16'].hex()}")
-            QMessageBox.information(self, "Decode (Placeholder)",
-                "Permutation & bit-plane can be rebuilt from token + key.\nProceed to extract bits and validate K_check.")
+            info, kd = self._derive_keys_from_token(token, user_key)
+            if info["media_kind"] != "audio":
+                raise ValueError("This token is not for audio")
+            raw_u8, params = self._read_wav_bytes(self.stego_path)
+            lsb = info["lsb"]; roi = info["roi"]; K_perm = kd["K_perm"]; K_bit = kd["K_bit"]; K_check = kd["K_check"]
+            tgt_perm = self._rebuild_indices_perm(params, roi, K_perm)
+            capacity_bits = len(tgt_perm) * lsb
+            if capacity_bits < HEADER_TOTAL_LEN*8:
+                raise ValueError("ROI too small to contain header")
+            # 1) Extract header
+            header_bits = self._extract_bits(raw_u8, tgt_perm, HEADER_TOTAL_LEN*8, lsb, K_bit[0])
+            header_bytes = self._bits_to_bytes(header_bits)
+            ph = parse_header(header_bytes)
+            if ph.kcheck4 != K_check:
+                raise ValueError("Wrong key/token (K_check mismatch)")
+            if ph.lsb != lsb or ph.roi != roi:
+                raise ValueError("Token/controls do not match embedded header")
+            # 2) Extract payload
+            need_bits = ph.payload_len * 8
+            total_needed = HEADER_TOTAL_LEN*8 + need_bits
+            if capacity_bits < total_needed:
+                raise ValueError("ROI capacity too small for embedded payload")
+            # We already consumed header_bits from the start of tgt_perm. Continue from there:
+            # For simplicity, re-extract total_needed and slice (cheap and deterministic)
+            all_bits = self._extract_bits(raw_u8, tgt_perm, total_needed, lsb, K_bit[0])
+            payload_bits = all_bits[HEADER_TOTAL_LEN*8: HEADER_TOTAL_LEN*8 + need_bits]
+            payload_bytes = self._bits_to_bytes(payload_bits)
+            # Try UTF-8 display; otherwise offer to save
+            try:
+                text = payload_bytes.decode("utf-8")
+                self.log(f"Decoded text payload ({len(payload_bytes)} bytes):\n{text}")
+                QMessageBox.information(self, "Decode", f"Extracted text payload ({len(payload_bytes)} bytes). See Log.")
+            except UnicodeDecodeError:
+                # ask where to save
+                out_path, _ = QFileDialog.getSaveFileName(self, "Save payload as…", "payload.bin")
+                if out_path:
+                    with open(out_path, "wb") as f: f.write(payload_bytes)
+                    self.log(f"Saved binary payload to: {out_path} ({len(payload_bytes)} bytes)")
+                    QMessageBox.information(self, "Decode", f"Binary payload saved ({len(payload_bytes)} bytes).")
+                else:
+                    self.log("[INFO] Binary payload not saved (user canceled).")
         except Exception as e:
             self.error(str(e))
 
@@ -779,12 +989,11 @@ class AudioDecodeTab(QWidget):
         QMessageBox.critical(self, "Error", msg)
         self.log(f"[ERROR] {msg}")
 
-
-# ---------- Suite ----------
+# -------------------------------
+# Suite
 class AudioSuite(QWidget):
     def __init__(self):
         super().__init__()
-        tabs = QTabWidget()
-        tabs.addTab(AudioEncodeTab(), "Encode")
-        tabs.addTab(AudioDecodeTab(), "Decode")
+        tabs = QTabWidget(); tabs.addTab(AudioEncodeTab(), "Encode"); tabs.addTab(AudioDecodeTab(), "Decode")
         lay = QVBoxLayout(self); lay.addWidget(tabs)
+
