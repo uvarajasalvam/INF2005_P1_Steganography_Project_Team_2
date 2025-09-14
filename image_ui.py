@@ -1,8 +1,10 @@
 # image_ui.py
+import math
 import os, io, zlib, hmac, hashlib, struct, base64
 from pathlib import Path
 
 from numpy.random import PCG64, Generator
+import numpy as np
 from PIL import Image
 
 from PySide6.QtCore import Qt, QRect, Signal
@@ -120,6 +122,67 @@ def parse_key_token(token: str) -> dict:
     media_kind = "image" if media_code == 0 else "audio"
     return {"media_kind": media_kind, "lsb": lsb, "roi": (x0,y0,w,h), "salt16": salt16, "kcheck4": kcheck4}
 
+# ----- Image helpers -----
+def _img_to_array(path: str):
+    # Load with NO color conversion to avoid any LSB changes from color management.
+    im = Image.open(path)
+    if im.mode != "RGB":
+        # Refuse non-RGB modes to keep exact byte fidelity of channels.
+        raise ValueError(f"Image must be 24-bit RGB. Got mode={im.mode}. "
+                         "Please use the PNG/BMP saved by this app (RGB).")
+    return np.array(im, dtype=np.uint8), im
+
+
+def _array_to_img(a: np.ndarray):
+    return Image.fromarray(a, mode="RGB")
+
+def _roi_view(a: np.ndarray, x0, y0, w, h) -> np.ndarray:
+    return a[y0:y0+h, x0:x0+w, :]
+
+def _bytes_from_array(roi_view: np.ndarray) -> np.ndarray:
+    return roi_view.reshape(-1)  # 1-D uint8
+
+def _bytes_to_bits(b: bytes) -> np.ndarray:
+    arr = np.frombuffer(b, dtype=np.uint8)
+    return np.unpackbits(arr)
+
+def _bits_to_bytes(bits: np.ndarray) -> bytes:
+    if bits.size % 8 != 0:
+        bits = np.pad(bits, (0, 8 - (bits.size % 8)))
+    return bytes(np.packbits(bits.astype(np.uint8)))
+
+def _write_bits_into_carriers(
+    carriers: np.ndarray,
+    bits: np.ndarray,
+    lsb: int,
+    bit_offset: int,
+    positions: np.ndarray,
+):
+    """
+    positions[i] points to the carrier (byte) that stores bits[i].
+    We cycle bit-planes as (bit_offset + i) % lsb.
+    All math is masked to 8 bits to avoid negative python-ints.
+    """
+    for i, (pos, b) in enumerate(zip(positions, bits)):
+        plane = (bit_offset + i) % lsb
+        mask = (1 << plane) & 0xFF                   # 8-bit mask
+        v = int(carriers[pos]) & 0xFF                # read as int 0..255
+        newv = (v & (~mask & 0xFF)) | ((int(b) << plane) & mask)
+        carriers[pos] = np.uint8(newv)               # write back as uint8
+
+
+def _read_bits_from_carriers(carriers: np.ndarray, n_bits: int, lsb: int, bit_offset: int, positions: np.ndarray) -> np.ndarray:
+    out = np.zeros(n_bits, dtype=np.uint8)
+    for i in range(n_bits):
+        plane = (bit_offset + i) % lsb
+        mask = 1 << plane
+        out[i] = (carriers[positions[i]] & mask) >> plane
+    return out
+
+def _permute_positions(base_positions: np.ndarray, rng: Generator) -> np.ndarray:
+    idx = base_positions.copy()
+    rng.shuffle(idx)
+    return idx
 
 # ---------- Widgets ----------
 class ImageView(QtWidgets.QFrame):
@@ -403,7 +466,7 @@ class ImageEncodeTab(QWidget):
             self.cap_label.setText("Select ROI and add payload to check fit."); return
         lsb = self.current_lsb()
         x0,y0,w,h = self.roi_img
-        channels = self.img_info["bands"]
+        channels = 3
         capacity_bits = w*h*channels*lsb
         payload_bits = self.payload_panel.payload_bits()
         if payload_bits is None:
@@ -427,31 +490,135 @@ class ImageEncodeTab(QWidget):
         key = self.key_edit.text().strip()
         if not key:
             self.error("Key is required."); return
+
         try:
+            # 0) Derive salts/keys and build header + Final Key token
             lsb = self.current_lsb()
+            x0, y0, w, h = self.roi_img
+            if w <= 0 or h <= 0:
+                raise ValueError("ROI width/height must be positive.")
             cover_id = cover_fingerprint(self.cover_path)
             full_salt = canonical_salt(lsb, self.roi_img, cover_id, "image")
             salt16 = full_salt[:16]
+
             kd = kdf_from_key(key, salt16)
-            K_perm, K_bit, K_crypto, K_check, nonce = kd["K_perm"], kd["K_bit"], kd["K_crypto"], kd["K_check"], kd["nonce"]
-            header = build_header(1, lsb, self.roi_img, len(payload), cover_id, salt16, nonce, K_check)
+            K_perm, K_bit = kd["K_perm"], kd["K_bit"]
+            K_crypto, K_check, nonce = kd["K_crypto"], kd["K_check"], kd["nonce"]  # crypto optional
+
+            header = build_header(
+                version=1,
+                lsb=lsb,
+                roi_xywh=self.roi_img,
+                payload_len=len(payload),
+                cover_fp16=cover_id,
+                salt16=salt16,
+                nonce12=nonce,
+                kcheck4=K_check
+            )
             token = make_key_token("image", lsb, self.roi_img, salt16, K_check)
             self.key_token_edit.setText(token)
-            # TODO: embed header+payload into pixels
+
+            # 1) Load image and get ROI carriers (RGB uint8)
+            arr, _ = _img_to_array(self.cover_path)        # RGB uint8
+            H, W, C = arr.shape                            # C = 3
+            if x0 + w > W or y0 + h > H:
+                raise ValueError("ROI goes outside the image bounds.")
+            roi_view = _roi_view(arr, x0, y0, w, h)[:, :, :3]
+
+            # >>> Make ROI contiguous so writes persist, and flatten that.
+            roi_buf = np.ascontiguousarray(roi_view)       # <<< key fix
+            carriers = roi_buf.reshape(-1)                 # safe to write
+
+            # 2) Prepare bits
+            header_bits = _bytes_to_bits(header)           # 84 bytes -> 672 bits
+            payload_bits = _bytes_to_bits(payload)
+            total_bits = header_bits.size + payload_bits.size
+            capacity_bits = carriers.size * lsb
+            if total_bits > capacity_bits:
+                raise ValueError(
+                    f"Capacity too small: need {total_bits} bits, ROI provides {capacity_bits} bits (lsb={lsb})."
+                )
+
+            # 3) positions (packing)
+            hdr_bits_n = header_bits.size
+            pay_bits_n = payload_bits.size
+            hdr_carriers = math.ceil(hdr_bits_n / lsb)
+            pay_carriers = math.ceil(pay_bits_n / lsb)
+
+            hdr_pos = (np.arange(hdr_bits_n, dtype=np.int64) // lsb)
+
+            pay_carrier_base = np.arange(hdr_carriers, hdr_carriers + pay_carriers, dtype=np.int64)
+            rng = rng_from_16_bytes(K_perm)
+            perm_carriers = pay_carrier_base.copy()
+            rng.shuffle(perm_carriers)
+            pay_pos = perm_carriers[(np.arange(pay_bits_n, dtype=np.int64) // lsb)]
+
+            # 4) plane offsets
+            bit_offset_header = 0
+            bit_offset_payload = int(K_bit[0] % lsb)
+
+            # 5) write (into roi_buf)
+            _write_bits_into_carriers(carriers, header_bits,  lsb, bit_offset_header, hdr_pos)
+            _write_bits_into_carriers(carriers, payload_bits, lsb, bit_offset_payload, pay_pos)
+
+            # >>> Write the modified ROI back into the image array before saving.
+            arr[y0:y0+h, x0:x0+w, :3] = roi_buf            # <<< key fix
+
+            # --- SELF-VERIFY HEADER right after writing (reads from modified roi_buf) ---
+            try:
+                hdr_bits_n = 84 * 8
+                hdr_carriers = math.ceil(hdr_bits_n / lsb)
+                hdr_pos_verify = (np.arange(hdr_bits_n, dtype=np.int64) // lsb)
+                hdr_bits_back = _read_bits_from_carriers(roi_buf.reshape(-1), hdr_bits_n, lsb, 0, hdr_pos_verify)
+                header_back = _bits_to_bytes(hdr_bits_back)
+                self.log(f"[self-check] header bytes[:8] = {header_back[:8].hex()}")
+                hchk = parse_header(header_back)
+                self.log(f"[self-check] header OK. magic='STG1', payload_len={hchk['payload_len']}")
+            except Exception as e:
+                self.error(f"Self-verify failed BEFORE saving: {e}")
+                return
+
+            # 6) Save lossless (PNG/BMP)
+            out = QFileDialog.getSaveFileName(
+                self,
+                "Save stego image",
+                "",
+                "PNG Image (*.png);;BMP Image (*.bmp)"
+            )[0]
+            if not out:
+                return
+
+            ext = os.path.splitext(out)[1].lower()
+            img_to_save = Image.fromarray(arr, mode="RGB")
+            if ext == ".png":
+                # Plain PNG save (avoid optimize/gamma/icc surprises)
+                try:
+                    from PIL.PngImagePlugin import PngInfo
+                    pnginfo = PngInfo()
+                except Exception:
+                    pnginfo = None
+                img_to_save.save(out, format="PNG", optimize=False, compress_level=0,
+                                icc_profile=None, pnginfo=pnginfo)
+            else:
+                img_to_save.save(out, format="BMP")
+
+            self.log(f"Stego saved: {out}")
+            QMessageBox.information(
+                self, "Encode done",
+                "Embedding complete. Final Key generated above; keep it safe for decoding."
+            )
             self.log(f"Derived token: {token}")
-            self.log(f"Header bytes={len(header)} salt16={salt16.hex()} bit_rot={K_bit[0]%lsb} order_seed={int.from_bytes(K_perm,'little')}")
-            QMessageBox.information(self, "Encode (Placeholder)",
-                "Final Key generated. Copy it and keep it for decoding.\nEmbedding not implemented in this stub.")
+
         except Exception as e:
             self.error(str(e))
 
+            
     def log(self, msg: str):
         self.log_edit.append(msg)
 
     def error(self, msg: str):
         QMessageBox.critical(self, "Error", msg)
         self.log(f"[ERROR] {msg}")
-
 
 # ---------- IMAGE DECODE ----------
 class ImageDecodeTab(QWidget):
@@ -503,22 +670,139 @@ class ImageDecodeTab(QWidget):
     def on_inspect(self):
         if not self.stego_path:
             self.error("Load a stego image first."); return
-        QMessageBox.information(self, "Inspect (Placeholder)",
-            "Read embedded header bits using the same permutation/LSB plane.\nUse parse_header() once you reconstruct the header bytes.")
+        token = self.key_token_edit.text().strip()
+        if not token:
+            self.error("Paste the Final Key token first."); return
+        try:
+            info = parse_key_token(token)
+            if info["media_kind"] != "image":
+                raise ValueError("Final Key is not for an image.")
+            # force ints (some parsers return numpy/int-like)
+            lsb = int(info["lsb"])
+            x0, y0, w, h = map(int, info["roi"])
+            self.log(f"[token] kind=image lsb={lsb} roi=({x0},{y0},{w},{h}) salt16={info['salt16'].hex()}")
+
+            # Load stego and make ROI carriers
+            arr, _ = _img_to_array(self.stego_path)  # RGBA
+            H, W, C = arr.shape
+            if x0 < 0 or y0 < 0 or w <= 0 or h <= 0 or x0 + w > W or y0 + h > H:
+                raise ValueError(f"ROI out of bounds for this image: image=({W}x{H}), roi=({x0},{y0},{w},{h})")
+            roi_view = _roi_view(arr, x0, y0, w, h)[:, :, :3]   # keep only RGB
+            carriers = roi_view.reshape(-1)                     # 1-D uint8
+
+            # Read fixed 84-byte header (packed, offset=0)
+            hdr_bits_n = 84 * 8
+            hdr_carriers = math.ceil(hdr_bits_n / lsb)
+            if hdr_carriers > carriers.size:
+                raise ValueError(f"ROI too small to contain header: need {hdr_carriers} carriers, have {carriers.size}")
+            hdr_pos = (np.arange(hdr_bits_n, dtype=np.int64) // lsb)
+            hdr_bits = _read_bits_from_carriers(carriers, hdr_bits_n, lsb, 0, hdr_pos)
+            header_bytes = _bits_to_bytes(hdr_bits)
+            self.log(f"[inspect] header bytes[:8] = {header_bytes[:8].hex()}")
+
+            try:
+                hdr = parse_header(header_bytes)
+            except Exception as e:
+                # quick diagnose: brute-force lsb to see if token's lsb mismatched
+                found = None
+                for guess in range(1, 9):
+                    nc = math.ceil(hdr_bits_n / guess)
+                    if nc > carriers.size: 
+                        continue
+                    pos = (np.arange(hdr_bits_n, dtype=np.int64) // guess)
+                    bits = _read_bits_from_carriers(carriers, hdr_bits_n, guess, 0, pos)
+                    hb = _bits_to_bytes(bits)
+                    if hb[:4] == b"STG1":
+                        found = guess
+                        break
+                magic = header_bytes[:4]
+                crc_calc = zlib.crc32(header_bytes[:80]) & 0xFFFFFFFF if len(header_bytes) >= 84 else None
+                if found:
+                    self.error(f"Header parse failed: {e}\n"
+                            f"magic={magic!r} with lsb={lsb}; BUT looks like header present with lsb={found}. "
+                            f"Use the matching token.")
+                else:
+                    self.error(f"Header parse failed: {e}\nmagic={magic!r}, len={len(header_bytes)}, crc_calc={crc_calc}")
+                return
+
+            # Show a quick summary
+            QMessageBox.information(
+                self, "Header",
+                f"Version: {hdr['version']}\n"
+                f"LSB: {hdr['lsb']}\n"
+                f"ROI: {hdr['roi']}\n"
+                f"Payload: {hdr['payload_len']} bytes"
+            )
+            self.log(f"Header OK. salt16={hdr['salt16'].hex()} kcheck4={hdr['kcheck4'].hex()}")
+
+        except Exception as e:
+            self.error(str(e))
+
 
     def on_decode(self):
         if not self.stego_path:
             self.error("Load a stego image first."); return
         token = self.key_token_edit.text().strip()
         user_key = self.user_key_edit.text().strip()
-        if not token or not user_key:
-            self.error("Provide both Final Key token and the user key."); return
+        if not token:
+            self.error("Paste the Final Key token."); return
+        if not user_key:
+            self.error("Enter the User Key."); return
+
         try:
             info = parse_key_token(token)
-            kd = kdf_from_key(user_key, info["salt16"])
-            self.log(f"Parsed token: media={info['media_kind']} lsb={info['lsb']} roi={info['roi']} salt16={info['salt16'].hex()}")
-            QMessageBox.information(self, "Decode (Placeholder)",
-                "Permutation & bit-plane can be rebuilt from token + key.\nProceed to extract bits and validate K_check.")
+            if info["media_kind"] != "image":
+                raise ValueError("Final Key is not for an image.")
+            lsb = int(info["lsb"])
+            x0, y0, w, h = map(int, info["roi"])
+            salt16 = info["salt16"]
+            self.log(f"[token] kind=image lsb={lsb} roi=({x0},{y0},{w},{h}) salt16={salt16.hex()}")
+
+            kd = kdf_from_key(user_key, salt16)
+            K_perm, K_bit = kd["K_perm"], kd["K_bit"]
+            bit_offset_payload = int(K_bit[0] % lsb)
+
+            # Load stego image and get ROI carriers
+            arr, _ = _img_to_array(self.stego_path)  # RGBA
+            H, W, C = arr.shape
+            if x0 < 0 or y0 < 0 or w <= 0 or h <= 0 or x0 + w > W or y0 + h > H:
+                raise ValueError(f"ROI out of bounds: image=({W}x{H}), roi=({x0},{y0},{w},{h})")
+            roi_view = _roi_view(arr, x0, y0, w, h)[:, :, :3]   # keep only RGB
+            carriers = roi_view.reshape(-1)                     # 1-D uint8
+
+            # --- Header (packed, offset=0, unpermuted) ---
+            hdr_bits_n = 84 * 8
+            hdr_carriers = math.ceil(hdr_bits_n / lsb)
+            if hdr_carriers > carriers.size:
+                raise ValueError(f"ROI too small to contain header: need {hdr_carriers} carriers, have {carriers.size}")
+            hdr_pos = (np.arange(hdr_bits_n, dtype=np.int64) // lsb)
+            hdr_bits = _read_bits_from_carriers(carriers, hdr_bits_n, lsb, 0, hdr_pos)
+            header_bytes = _bits_to_bytes(hdr_bits)
+            self.log(f"[decode] header[:8] = {header_bytes[:8].hex()}")
+            hdr = parse_header(header_bytes)
+
+            # --- Payload (permuted, packed, rotated) ---
+            pay_len = hdr["payload_len"]
+            pay_bits_n = pay_len * 8
+            pay_carriers = math.ceil(pay_bits_n / lsb)
+            if hdr_carriers + pay_carriers > carriers.size:
+                raise ValueError(f"ROI too small for header+payload: need {hdr_carriers+pay_carriers}, have {carriers.size}")
+
+            pay_carrier_base = np.arange(hdr_carriers, hdr_carriers + pay_carriers, dtype=np.int64)
+            rng = rng_from_16_bytes(K_perm)
+            perm_carriers = pay_carrier_base.copy()
+            rng.shuffle(perm_carriers)
+
+            pay_pos = perm_carriers[(np.arange(pay_bits_n, dtype=np.int64) // lsb)]
+            pay_bits = _read_bits_from_carriers(carriers, pay_bits_n, lsb, bit_offset_payload, pay_pos)
+            payload_bytes = _bits_to_bytes(pay_bits)[:pay_len]
+
+            out = QFileDialog.getSaveFileName(self, "Save extracted payload", "", "All Files (*)")[0]
+            if out:
+                with open(out, "wb") as f:
+                    f.write(payload_bytes)
+                self.log(f"Payload saved: {out}")
+                QMessageBox.information(self, "Decode done", "Payload extracted and saved.")
         except Exception as e:
             self.error(str(e))
 
