@@ -5,6 +5,7 @@ from pathlib import Path
 from numpy.random import PCG64, Generator
 from PySide6.QtGui import QPixmap, QMovie
 from PIL import Image
+from PIL import ImageSequence
 
 from PySide6.QtCore import Qt, QRect, Signal
 import PySide6.QtCore as QtCore
@@ -122,20 +123,149 @@ def parse_key_token(token: str) -> dict:
     return {"media_kind": media_kind, "lsb": lsb, "roi": (x0,y0,w,h), "salt16": salt16, "kcheck4": kcheck4}
 
 # ---------- Stego helpers ----------
+def _gif_fullpal_buffers(gif: Image.Image):
+    """
+    Prepare GIF for embedding:
+      - Compose each source frame to a full RGBA canvas (handles partial frames).
+      - Build one global 256-color palette from the first composed frame.
+      - Convert all frames to that single palette WITHOUT dithering.
+      - Return per-frame FULL-CANVAS palette index buffers and metadata.
+    Returns:
+      frame_bufs: [bytearray] each length = W*H
+      W, H: ints
+      channels: 1
+      global_palette: list[int] len 768
+      durations: [int] ms per frame
+      base_info: dict {'loop', 'disposal'=2}   # NOTE: we do NOT carry transparency anymore
+    """
+    gif.seek(0)
+    W, H = gif.size
+
+    # A) Full-canvas composition (opaque RGBA)
+    canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    composed_rgba = []
+    durations = []
+    for frame in ImageSequence.Iterator(gif):
+        fr_rgba = frame.convert("RGBA")
+        canvas = Image.alpha_composite(canvas, fr_rgba)
+        composed_rgba.append(canvas.copy())
+        durations.append(frame.info.get("duration", gif.info.get("duration", 100)))
+
+    if not composed_rgba:
+        raise ValueError("Empty GIF: no frames found.")
+
+    # B) Single global palette from first composed frame
+    first_pal = composed_rgba[0].convert("RGB").quantize(colors=256, method=Image.MEDIANCUT, dither=Image.Dither.NONE)
+    global_palette = first_pal.getpalette()
+
+    # C) Convert ALL frames to that palette (no dithering) → index buffers
+    pal_frames = []
+    for fr in composed_rgba:
+        q = fr.convert("RGB").quantize(palette=first_pal, dither=Image.Dither.NONE)
+        q.putpalette(global_palette)
+        pal_frames.append(q)
+
+    frame_bufs = [bytearray(fr.tobytes()) for fr in pal_frames]
+
+    base_info = dict(gif.info)
+    base_info["loop"] = base_info.get("loop", 0)
+    # IMPORTANT: we deliberately do NOT propagate 'transparency'
+    # because frames are fully composed and opaque.
+    base_info.pop("transparency", None)
+    base_info["disposal"] = 2  # restore to background
+
+    return frame_bufs, W, H, 1, global_palette, durations, base_info
+
+def _gif_read_full_buffers(gif: Image.Image):
+    """
+    Read a stego GIF into FULL-CANVAS palette-index buffers.
+    Prefer 'P' frames; if Pillow yields RGB/RGBA, map each pixel back to the
+    exact global-palette index (no quantize). This preserves embedded LSBs
+    unless the file was saved with a different palette or with sub-rectangles.
+    """
+    from PIL import ImageSequence
+
+    gif.seek(0)
+    W, H = gif.size
+    frame_bufs = []
+    durations = []
+
+    # Global palette → color->index map (preserve first occurrence for stability)
+    pal = gif.getpalette()
+    if not pal or len(pal) < 768:
+        raise ValueError("GIF missing/invalid global palette; cannot read indices deterministically.")
+    palette_colors = [(pal[i], pal[i+1], pal[i+2]) for i in range(0, 768, 3)]
+    color_to_index = {}
+    for idx, rgb in enumerate(palette_colors):
+        if rgb not in color_to_index:
+            color_to_index[rgb] = idx
+
+    def map_rgb_to_indices(img_rgb: Image.Image) -> bytearray:
+        b = img_rgb.tobytes()  # W*H*3
+        out = bytearray(W * H)
+        mv = memoryview(b)
+        pos = 0
+        # cache per-frame unique colors to indices
+        local = {}
+        for i in range(W * H):
+            r = mv[pos]; g = mv[pos+1]; b_ = mv[pos+2]; pos += 3
+            key = (r, g, b_)
+            idx = local.get(key)
+            if idx is None:
+                idx = color_to_index.get(key)
+                if idx is None:
+                    # Fallback (shouldn't happen if saved with the same global palette):
+                    best_i, best_d = 0, 1_000_000
+                    for j, (pr, pg, pb) in enumerate(palette_colors):
+                        dr = pr - r; dg = pg - g; db = pb - b_
+                        d = dr*dr + dg*dg + db*db
+                        if d < best_d:
+                            best_i, best_d = j, d
+                    idx = best_i
+                local[key] = idx
+            out[i] = idx & 0xFF
+        return out
+
+    for frame in ImageSequence.Iterator(gif):
+        if frame.size != (W, H):
+            raise ValueError("Stego GIF frame is not full-canvas; expected subrectangles=False.")
+        if frame.mode == "P":
+            buf = bytearray(frame.tobytes())
+        else:
+            # Map back to indices using the global palette (no quantize)
+            buf = map_rgb_to_indices(frame.convert("RGB"))
+        frame_bufs.append(buf)
+        durations.append(frame.info.get("duration", gif.info.get("duration", 100)))
+
+    base_info = dict(gif.info)
+    base_info["loop"] = base_info.get("loop", 0)
+    base_info["disposal"] = 2
+    base_info.pop("transparency", None)
+
+    return frame_bufs, W, H, 1, durations, base_info
+
 def _ensure_8bit_mode(pil_img: Image.Image) -> tuple[Image.Image, int, str]:
     """
-    Ensure image is 8-bit per channel. Return (converted_img, channels, mode).
-    We support L, RGB, RGBA. Convert other modes to RGB.
+    Ensure image is 8-bit per channel.
+    Returns: (converted_img, channels, mode_str)
+      - L:    1 channel
+      - P:    1 channel (palette indices)
+      - RGB:  3 channels
+      - RGBA: 4 channels
+      - others → RGB
     """
     mode = pil_img.mode
     if mode == "L":
         return pil_img, 1, "L"
+    if mode == "P":
+        return pil_img, 1, "P"
     if mode == "RGB":
         return pil_img, 3, "RGB"
     if mode == "RGBA":
         return pil_img, 4, "RGBA"
-    # Palette or others → RGB
-    return pil_img.convert("RGB"), 3, "RGB"
+    conv = pil_img.convert("RGB")
+    return conv, 3, "RGB"
+
 
 def _img_bytes_and_geometry(img: Image.Image) -> tuple[bytearray, int, int, int]:
     """Return (mutable_bytes, width, height, channels)."""
@@ -838,29 +968,61 @@ class ImageEncodeTab(QWidget):
             self.cover_path = path
 
             if ext == ".gif":
-                # Animated preview via QMovie
+                # --- Animated preview via QMovie (UI only) ---
                 movie = QMovie(path)
                 if not movie.isValid():
                     raise ValueError("Failed to load GIF (invalid or unsupported).")
                 self.cover_qpix = None
                 self.cover_view.setImage(movie)
 
-                # Use PIL to inspect first frame for img_info/capacity/ROI
+                # --- Lightweight probe via PIL for capacity/durations ---
                 im = Image.open(path)
+                try:
+                    im.seek(0)
+                except Exception:
+                    pass
+
+                # Count frames and collect durations WITHOUT touching palettes
                 try:
                     n_frames = getattr(im, "n_frames", 1)
                 except Exception:
                     n_frames = 1
-                self.img_info = {"size": im.size, "mode": im.mode, "bands": len(im.getbands())}
+
+                durations = []
+                try:
+                    from PIL import ImageSequence
+                    for frame in ImageSequence.Iterator(im):
+                        # Do NOT call frame.putpalette(...) here — some frames are not 'P'
+                        durations.append(frame.info.get("duration", im.info.get("duration", 100)))
+                except Exception:
+                    # Fallback: use container-level duration if available
+                    durations = [im.info.get("duration", 100)] * max(1, n_frames)
+
+                if not durations:
+                    durations = [im.info.get("duration", 100)] * max(1, n_frames)
+
+                # Record minimal info needed for capacity
+                self.img_info = {
+                    "size": im.size,                 # (W, H)
+                    "mode": "P",                     # treat as palettized for capacity math
+                    "bands": 1,                      # palette index = 1 byte
+                    "n_frames": n_frames,
+                    "durations": durations,
+                    "loop": im.info.get("loop", 0),
+                    "format": im.format or "GIF",
+                }
+
+                w, h = im.size
                 self.cover_info.setText(
-                    f"Path: {path}\nFormat: {im.format}, Mode: {im.mode}, "
-                    f"Size: {im.size[0]}x{im.size[1]}\nFrames: {n_frames} (animated)"
+                    f"Path: {path}\n"
+                    f"Format: {self.img_info['format']}, Mode: {self.img_info['mode']}, "
+                    f"Size: {w}x{h}\n"
+                    f"Frames: {n_frames} (animated)"
                 )
-                self.log("Loaded GIF (animated). Preview shows animation; ROI applies to current frame area.")
-                self.log("Note: Encoding will produce a static PNG; animation is not preserved.") #remove after improvement made
+                self.log("Loaded GIF (animated). Preview shows animation; ROI applies to canvas area.")
 
             else:
-                # Static preview via QPixmap
+                # --- Static preview via QPixmap ---
                 qpix = QPixmap(path)
                 if qpix.isNull():
                     raise ValueError("Failed to load image.")
@@ -868,7 +1030,13 @@ class ImageEncodeTab(QWidget):
                 self.cover_view.setImage(qpix)
 
                 im = Image.open(path)
-                self.img_info = {"size": im.size, "mode": im.mode, "bands": len(im.getbands())}
+                self.img_info = {
+                    "size": im.size,
+                    "mode": im.mode,
+                    "bands": len(im.getbands()),
+                    "n_frames": 1,
+                    "format": im.format or ext.upper().lstrip("."),
+                }
                 self.cover_info.setText(
                     f"Path: {path}\nFormat: {im.format}, Mode: {im.mode}, Size: {im.size[0]}x{im.size[1]}"
                 )
@@ -882,6 +1050,7 @@ class ImageEncodeTab(QWidget):
         except Exception as e:
             self.error(str(e))
 
+
     def set_roi_from_image(self, x0: int, y0: int, w: int, h: int):
         self.roi_img = (x0, y0, w, h)
         self.update_capacity_label()
@@ -894,19 +1063,25 @@ class ImageEncodeTab(QWidget):
         if not self.cover_path or not self.roi_img or not self.img_info:
             self.cap_label.setText("Select ROI and add payload to check fit."); return
         lsb = self.current_lsb()
-        x0,y0,w,h = self.roi_img
-        channels = self.img_info["bands"]
-        capacity_bits = w*h*channels*lsb
+        x0, y0, w, h = self.roi_img
+        channels = self.img_info.get("bands", 3)
+        frames = self.img_info.get("n_frames", 1)
+        capacity_bits = w * h * channels * lsb * frames  # <-- multiply by frames
         payload_bits = self.payload_panel.payload_bits()
-        overhead_bits = 84*8  # header
+        overhead_bits = 84 * 8
         if payload_bits is None:
             self.cap_label.setText(
-                f"ROI capacity ≈ {capacity_bits} bits\nHeader requires {overhead_bits} bits.\nAdd payload (Text or File).")
+                f"ROI capacity ≈ {capacity_bits} bits "
+                f"(frames: {frames}, channels: {channels}, lsb: {lsb})\n"
+                f"Header requires {overhead_bits} bits.\n"
+                f"Add payload (Text or File)."
+            )
         else:
             need = overhead_bits + payload_bits
             ok = need <= capacity_bits
             self.cap_label.setText(
-                f"ROI capacity ≈ {capacity_bits} bits\n"
+                f"ROI capacity ≈ {capacity_bits} bits "
+                f"(frames: {frames}, channels: {channels}, lsb: {lsb})\n"
                 f"Header+Payload need: {need} bits "
                 f"({human_bytes((need+7)//8)})\n"
                 f"Result: {'OK' if ok else 'Too large'}"
@@ -925,14 +1100,130 @@ class ImageEncodeTab(QWidget):
             self.error("Key is required."); return
 
         try:
-            # Open cover and validate mode
             cover_pil = Image.open(self.cover_path)
+            ext = Path(self.cover_path).suffix.lower()
+
+            # ---------- GIF branch (animated, keep as GIF) ----------
+            if ext == ".gif":
+                cover_pil.seek(0)
+
+                # Full-canvas, single global palette indices
+                frame_bufs, imgW, imgH, channels, palette, durations, base_info = _gif_fullpal_buffers(cover_pil)
+                n_frames = len(frame_bufs)
+
+                # ROI & capacity
+                lsb = self.current_lsb()
+                x0, y0, w, h = self.roi_img
+                W, H = imgW, imgH
+                if w <= 0 or h <= 0 or x0 < 0 or y0 < 0 or x0+w > W or y0+h > H:
+                    self.error("ROI is out of bounds."); return
+                capacity_bits = w * h * channels * lsb * n_frames  # channels=1
+
+                # KDF & header
+                cover_id = cover_fingerprint(self.cover_path)
+                full_salt = canonical_salt(lsb, self.roi_img, cover_id, "image")
+                salt16 = full_salt[:16]
+                kd = kdf_from_key(key, salt16)
+                K_perm, K_bit, K_crypto, K_check, nonce = (
+                    kd["K_perm"], kd["K_bit"], kd["K_crypto"], kd["K_check"], kd["nonce"]
+                )
+
+                # Encrypt payload
+                ks = _hmac_keystream(K_crypto, nonce, len(payload))
+                cipher = _xor(payload, ks)
+
+                header = build_header(1, lsb, self.roi_img, len(payload), cover_id, salt16, nonce, K_check)
+
+                # Bitstream
+                bitstream = []
+                for b in header + cipher:
+                    for k in range(8):
+                        bitstream.append((b >> (7 - k)) & 1)
+
+                n_bits = len(bitstream)
+                if n_bits > capacity_bits:
+                    self.error(f"Payload too large for ROI capacity.\nNeed {n_bits} bits, capacity {capacity_bits} bits."); return
+
+                # Slot model across ALL frames
+                slots_per_frame = w * h * channels
+                slots_total = slots_per_frame * n_frames
+                perm = _make_perm(slots_total, K_perm)
+                rot = K_bit[0] % lsb
+
+                # Embed
+                for i_bit, bit in enumerate(bitstream):
+                    slot_index = i_bit // lsb
+                    plane = ((i_bit % lsb) + rot) % lsb
+
+                    s = perm[slot_index]
+                    fidx = s // slots_per_frame
+                    rem  = s %  slots_per_frame
+
+                    px = rem  # channels=1
+                    rel_x = px % w
+                    rel_y = px // w
+                    x = x0 + rel_x
+                    y = y0 + rel_y
+                    idx = (y * imgW + x)
+
+                    frame_bufs[fidx][idx] = _set_bit(frame_bufs[fidx][idx], plane, bit)
+
+                # Rebuild P-mode frames and save animated GIF (full-canvas, no optimization)
+                rebuilt = []
+                for i, buf in enumerate(frame_bufs):
+                    fr = Image.new("P", (imgW, imgH))
+                    fr.putpalette(palette)
+                    fr.putdata(buf)                     # exact indices
+                    fr.info["duration"] = durations[i] if i < len(durations) else (durations[-1] if durations else 100)
+                    fr.info["disposal"] = 2
+                    # Make sure there is NO transparency carried (composited frames are opaque)
+                    fr.info.pop("transparency", None)
+                    rebuilt.append(fr)
+
+                out_path = str(Path(self.cover_path).with_suffix("")) + "_stego.gif"
+
+                # Critical save options:
+                #  - optimize=False         → do not re-map indices
+                #  - subrectangles=False    → force full-canvas frames
+                #  - no 'transparency'      → prevents RGBA expansion on load
+                #  - disposal=2             → restore to background
+                save_kwargs = dict(
+                    save_all=True,
+                    append_images=rebuilt[1:],
+                    loop=base_info.get("loop", 0),
+                    duration=durations,
+                    optimize=False,
+                    disposal=2,
+                    subrectangles=False,    # <--- IMPORTANT
+                )
+                # DO NOT set transparency — it makes Pillow composite to RGBA on read
+                # save_kwargs["transparency"] = base_info.get("transparency")  # (intentionally omitted)
+
+                rebuilt[0].save(out_path, format="GIF", **save_kwargs)
+                # sidecar meta
+                try:
+                    meta_path = Path(out_path).with_suffix(".meta")
+                    meta_path.write_text(str(Path(self.cover_path).absolute()), encoding="utf-8")
+                    self.log(f"Saved meta: {meta_path}")
+                except Exception as _e:
+                    self.log(f"[WARN] Could not write meta file: {_e}")
+
+                token = make_key_token("image", lsb, self.roi_img, salt16, K_check)
+                self.key_token_edit.setText(token)
+                self.log(f"Derived token: {token}")
+                self.log(f"Header bytes={len(header)} salt16={salt16.hex()} bit_rot={rot} order_seed={int.from_bytes(K_perm,'little')}")
+                QMessageBox.information(
+                    self, "Encode complete",
+                    f"Embedded {len(payload)} bytes (encrypted) with a {len(header)}-byte header.\n"
+                    f"Saved: {out_path}\nCopy the Final Key for decoding."
+                )
+                return
+
+            # ---------- non-GIF branch (static) ----------
             cover_conv, channels, mode = _ensure_8bit_mode(cover_pil)
             if cover_conv.size != cover_pil.size:
-                # Converted from unsupported mode; warn but proceed
                 self.log("Cover converted to RGB for embedding.")
 
-            # ROI & capacity
             lsb = self.current_lsb()
             x0, y0, w, h = self.roi_img
             W, H = cover_conv.size
@@ -940,47 +1231,36 @@ class ImageEncodeTab(QWidget):
                 self.error("ROI is out of bounds."); return
             capacity_bits = w*h*channels*lsb
 
-            # KDF & header
             cover_id = cover_fingerprint(self.cover_path)
             full_salt = canonical_salt(lsb, self.roi_img, cover_id, "image")
             salt16 = full_salt[:16]
             kd = kdf_from_key(key, salt16)
             K_perm, K_bit, K_crypto, K_check, nonce = kd["K_perm"], kd["K_bit"], kd["K_crypto"], kd["K_check"], kd["nonce"]
 
-            # Encrypt payload with stdlib keystream (deterministic)
             ks = _hmac_keystream(K_crypto, nonce, len(payload))
             cipher = _xor(payload, ks)
 
             header = build_header(1, lsb, self.roi_img, len(payload), cover_id, salt16, nonce, K_check)
             total_bits = (len(header) + len(cipher)) * 8
             if total_bits > capacity_bits:
-                self.error(f"Payload too large for ROI capacity.\n"
-                        f"Need {total_bits} bits, capacity {capacity_bits} bits."); return
+                self.error(f"Payload too large for ROI capacity.\nNeed {total_bits} bits, capacity {capacity_bits} bits."); return
 
-            # BIT STREAM: header first, then cipher
             bitstream = []
             for b in header + cipher:
                 for k in range(8):
                     bitstream.append((b >> (7-k)) & 1)
-            n_bits = len(bitstream)
 
-            # Prepare image bytes
             buf, imgW, imgH, ch = _img_bytes_and_geometry(cover_conv)
-
-            # Slot model: slot = a pixel-channel (no plane). Planes are assigned per-bit.
             slots = w*h*channels
             perm = _make_perm(slots, K_perm)
             rot = K_bit[0] % lsb
 
-            # Embed
-            i_bit = 0
+            i_bit = 0; n_bits = len(bitstream)
             while i_bit < n_bits:
                 slot_index = i_bit // lsb
                 plane = ((i_bit % lsb) + rot) % lsb
                 if slot_index >= slots:
-                    # Should not happen due to capacity check
                     self.error("Internal error: slot overflow during embed."); return
-                # Map slot → (x,y,c)
                 s = perm[slot_index]
                 px = s // channels
                 c  = s % channels
@@ -989,17 +1269,12 @@ class ImageEncodeTab(QWidget):
                 x = x0 + rel_x
                 y = y0 + rel_y
                 idx = _pixel_byte_index(x, y, c, imgW, ch)
-
-                # Set bit
-                bit = bitstream[i_bit]
-                buf[idx] = _set_bit(buf[idx], plane, bit)
+                buf[idx] = _set_bit(buf[idx], plane, bitstream[i_bit])
                 i_bit += 1
 
-            # Write stego as PNG (lossless). Warn if source was JPEG.
             out_path = str(Path(self.cover_path).with_suffix("")) + "_stego.png"
             Image.frombytes(mode, (imgW, imgH), bytes(buf)).save(out_path, format="PNG")
-            
-            # NEW: write sidecar meta with absolute cover path for auto-load during decode
+
             try:
                 meta_path = Path(out_path).with_suffix(".meta")
                 meta_path.write_text(str(Path(self.cover_path).absolute()), encoding="utf-8")
@@ -1013,8 +1288,7 @@ class ImageEncodeTab(QWidget):
             self.log(f"Derived token: {token}")
             self.log(f"Header bytes={len(header)} salt16={salt16.hex()} bit_rot={rot} order_seed={int.from_bytes(K_perm,'little')}")
             if Path(self.cover_path).suffix.lower() in {".jpg", ".jpeg"}:
-                self.log("Note: Source was JPEG. Bits are saved losslessly to PNG as '..._stego.png'. "
-                        "Re-saving as JPEG will corrupt hidden data.")
+                self.log("Note: Source was JPEG. Bits are saved losslessly to PNG as '..._stego.png'. Re-saving as JPEG will corrupt hidden data.")
             QMessageBox.information(self, "Encode complete",
                 f"Embedded {len(payload)} bytes (encrypted) with a {len(header)}-byte header.\n"
                 f"Saved: {out_path}\nCopy the Final Key for decoding.")
@@ -1089,45 +1363,67 @@ class ImageDecodeTab(QWidget):
             if info["media_kind"] != "image":
                 self.error("Final Key is not for an image."); return
 
-            # Prepare image
             im = Image.open(self.stego_path)
-            conv, channels, mode = _ensure_8bit_mode(im)
-            W, H = conv.size
+            ext = Path(self.stego_path).suffix.lower()
+
+            # ---- prep buffers/geometry (no quantize!) ----
+            if ext == ".gif":
+                im.seek(0)
+                frame_bufs, imgW, imgH, channels, durations, base_info = _gif_read_full_buffers(im)
+                n_frames = len(frame_bufs)
+                W, H = imgW, imgH
+            else:
+                conv, channels, mode = _ensure_8bit_mode(im)
+                buf, imgW, imgH, ch = _img_bytes_and_geometry(conv)
+                frame_bufs = [buf]
+                n_frames = 1
+                W, H = imgW, imgH
+
             x0, y0, w, h = info["roi"]
             if w <= 0 or h <= 0 or x0 < 0 or y0 < 0 or x0+w > W or y0+h > H:
                 self.error("Token ROI is out of bounds for this image."); return
 
-            # Derive keys and reconstruct bitstream just for header (84 bytes)
             kd = kdf_from_key(user_key, info["salt16"])
             K_perm, K_bit, K_crypto, K_check, nonce = kd["K_perm"], kd["K_bit"], kd["K_crypto"], kd["K_check"], kd["nonce"]
-
-            # Quick key check
             if K_check != info["kcheck4"]:
                 self.error("Wrong user key for this Final Key (K_check mismatch)."); return
 
-            # Read header bits
-            target_bits = 84 * 8
-            buf, imgW, imgH, ch = _img_bytes_and_geometry(conv)
             lsb = info["lsb"]; rot = K_bit[0] % lsb
-            slots = w*h*channels
-            if target_bits > slots * lsb:
+            slots_per_frame = w * h * channels
+            slots_total = slots_per_frame * n_frames
+            target_bits = 84 * 8
+            if target_bits > slots_total * lsb:
                 self.error("Stego ROI cannot even hold a header; file/token mismatch."); return
-            perm = _make_perm(slots, K_perm)
+            perm = _make_perm(slots_total, K_perm)
 
             bits = []
             for i_bit in range(target_bits):
                 slot_index = i_bit // lsb
                 plane = ((i_bit % lsb) + rot) % lsb
+
                 s = perm[slot_index]
-                px = s // channels
-                c  = s % channels
-                rel_x = px % w
-                rel_y = px // w
-                x = x0 + rel_x
-                y = y0 + rel_y
-                idx = _pixel_byte_index(x, y, c, imgW, ch)
-                bits.append(_get_bit(buf[idx], plane))
-            # Bits → bytes
+                fidx = s // slots_per_frame
+                rem  = s %  slots_per_frame
+
+                if channels == 1:
+                    px = rem
+                    rel_x = px % w
+                    rel_y = px // w
+                    x = x0 + rel_x
+                    y = y0 + rel_y
+                    idx = (y * imgW + x)
+                else:
+                    px = rem // channels
+                    c  = rem % channels
+                    rel_x = px % w
+                    rel_y = px // w
+                    x = x0 + rel_x
+                    y = y0 + rel_y
+                    idx = _pixel_byte_index(x, y, c, imgW, channels)
+
+                bits.append(_get_bit(frame_bufs[fidx][idx], plane))
+
+            # bits → bytes
             b = bytearray()
             for i in range(0, len(bits), 8):
                 byte = 0
@@ -1136,10 +1432,10 @@ class ImageDecodeTab(QWidget):
                 b.append(byte)
 
             hdr = parse_header(bytes(b))
-
-            # Sanity checks: lsb/roi must match token
             if hdr["lsb"] != lsb or hdr["roi"] != tuple(info["roi"]):
                 self.error("Header mismatch (ROI/LSB do not match Final Key)."); return
+            if hdr["salt16"] != info["salt16"]:
+                self.error("Header salt does not match Final Key salt."); return
 
             self.log(f"Header OK. version={hdr['version']} payload_len={hdr['payload_len']}")
             self.log(f"salt16={hdr['salt16'].hex()} nonce12={hdr['nonce12'].hex()} cover_fp16={hdr['cover_fp16'].hex()}")
@@ -1162,8 +1458,22 @@ class ImageDecodeTab(QWidget):
                 self.error("Final Key is not for an image."); return
 
             im = Image.open(self.stego_path)
-            conv, channels, mode = _ensure_8bit_mode(im)
-            W, H = conv.size
+            ext = Path(self.stego_path).suffix.lower()
+
+            # ---- prepare buffers / geometry (GIF multi-frame vs single) ----
+            if ext == ".gif":
+                im.seek(0)
+                # CRITICAL: do NOT quantize here, just read existing indices
+                frame_bufs, imgW, imgH, channels, durations, base_info = _gif_read_full_buffers(im)
+                n_frames = len(frame_bufs)
+                W, H = imgW, imgH
+            else:
+                conv, channels, mode = _ensure_8bit_mode(im)
+                buf, imgW, imgH, ch = _img_bytes_and_geometry(conv)
+                frame_bufs = [buf]
+                n_frames = 1
+                W, H = imgW, imgH
+
             x0, y0, w, h = info["roi"]
             if w <= 0 or h <= 0 or x0 < 0 or y0 < 0 or x0+w > W or y0+h > H:
                 self.error("Token ROI is out of bounds for this image."); return
@@ -1175,28 +1485,41 @@ class ImageDecodeTab(QWidget):
             if K_check != info["kcheck4"]:
                 self.error("Wrong user key for this Final Key (K_check mismatch)."); return
 
-            buf, imgW, imgH, ch = _img_bytes_and_geometry(conv)
             lsb = info["lsb"]; rot = K_bit[0] % lsb
-            slots = w*h*channels
-            perm = _make_perm(slots, K_perm)
+            slots_per_frame = w * h * channels
+            slots_total = slots_per_frame * n_frames
+            perm = _make_perm(slots_total, K_perm)
 
-            # ---- helper that supports a starting bit offset ----
             def _read_bits(n_bits: int, start_bit: int = 0) -> bytes:
-                if n_bits + start_bit > slots * lsb:
+                if n_bits + start_bit > slots_total * lsb:
                     raise ValueError("Requested bits exceed ROI capacity.")
                 bits = []
                 for i_bit in range(start_bit, start_bit + n_bits):
                     slot_index = i_bit // lsb
                     plane = ((i_bit % lsb) + rot) % lsb
+
                     s = perm[slot_index]
-                    px = s // channels
-                    c  = s % channels
-                    rel_x = px % w
-                    rel_y = px // w
-                    x = x0 + rel_x
-                    y = y0 + rel_y
-                    idx = _pixel_byte_index(x, y, c, imgW, ch)
-                    bits.append(_get_bit(buf[idx], plane))
+                    fidx = s // slots_per_frame
+                    rem  = s %  slots_per_frame
+
+                    if channels == 1:
+                        px = rem
+                        rel_x = px % w
+                        rel_y = px // w
+                        x = x0 + rel_x
+                        y = y0 + rel_y
+                        idx = (y * imgW + x)
+                    else:
+                        px = rem // channels
+                        c  = rem % channels
+                        rel_x = px % w
+                        rel_y = px // w
+                        x = x0 + rel_x
+                        y = y0 + rel_y
+                        idx = _pixel_byte_index(x, y, c, imgW, channels)
+
+                    bits.append(_get_bit(frame_bufs[fidx][idx], plane))
+
                 out = bytearray()
                 for i in range(0, len(bits), 8):
                     byte = 0
@@ -1205,10 +1528,11 @@ class ImageDecodeTab(QWidget):
                     out.append(byte)
                 return bytes(out)
 
-            # read + verify header (84 bytes = 672 bits) starting at bit 0
+            # --- header then payload ---
             HEADER_BYTES = 84
             header_bytes = _read_bits(HEADER_BYTES * 8, start_bit=0)
             hdr = parse_header(header_bytes)
+
             if hdr["lsb"] != lsb or hdr["roi"] != tuple(info["roi"]):
                 self.error("Header mismatch (ROI/LSB do not match Final Key)."); return
             if hdr["salt16"] != info["salt16"]:
@@ -1216,50 +1540,39 @@ class ImageDecodeTab(QWidget):
 
             payload_len = hdr["payload_len"]
             total_bits_needed = (HEADER_BYTES + payload_len) * 8
-            if total_bits_needed > slots * lsb:
+            if total_bits_needed > slots_total * lsb:
                 self.error("Stego does not contain the declared payload length (capacity shortfall)."); return
 
-            # read payload bits starting AFTER the header
-            payload_start = HEADER_BYTES * 8
-            cipher_bytes = _read_bits(payload_len * 8, start_bit=payload_start)
+            cipher_bytes = _read_bits(payload_len * 8, start_bit=HEADER_BYTES * 8)
 
-            # decrypt via stdlib keystream (nonce from header is authoritative)
             ks = _hmac_keystream(K_crypto, hdr["nonce12"], len(cipher_bytes))
             payload = _xor(cipher_bytes, ks)
 
             out_dir = Path(self.stego_path).parent
             out_base = Path(self.stego_path).stem
 
-            ext, label, is_text = guess_image_or_text_ext(payload)
-            dest = out_dir / f"{out_base}_payload{ext}"
+            ext_guess, label, is_text = guess_image_or_text_ext(payload)
+            dest = out_dir / f"{out_base}_payload{ext_guess}"
 
-            if is_text and ext == ".txt":
-                # Save as text
+            if is_text and ext_guess == ".txt":
                 txt = payload.decode("utf-8", errors="strict")
                 with open(dest, "w", encoding="utf-8") as f:
                     f.write(txt)
-                # preview = txt if len(txt) < 500 else txt[:500] + "…"
-                # self.log("Decoded UTF-8 preview:\n" + preview)
             else:
-                # Save raw bytes (images or unknown binary)
                 with open(dest, "wb") as f:
                     f.write(payload)
 
             self.log(f"Saved payload as {dest} ({label}, {human_bytes(len(payload))})")
-            QMessageBox.information(
-                self, "Decode complete",
-                f"Recovered {len(payload)} bytes.\nDetected: {label}\nSaved to:\n{dest}"
-            )
-            
-            # --- Try to auto-load the original cover for side-by-side preview ---
+            QMessageBox.information(self, "Decode complete",
+                                    f"Recovered {len(payload)} bytes.\nDetected: {label}\nSaved to:\n{dest}")
+
+            # --- optional: auto-load original cover (unchanged) ---
             cover_guess = None
             try:
-                # 1) Prefer sidecar .meta created during encode (absolute cover path)
                 meta = Path(self.stego_path).with_suffix(".meta")
                 if meta.exists():
                     candidate = meta.read_text(encoding="utf-8").strip()
                     if candidate and Path(candidate).exists():
-                        # Verify the meta cover matches the header fingerprint
                         try:
                             if cover_fingerprint(candidate) == hdr["cover_fp16"]:
                                 cover_guess = candidate
@@ -1269,12 +1582,11 @@ class ImageDecodeTab(QWidget):
                         except Exception as _ve:
                             self.log(f"[WARN] Could not verify meta cover fingerprint: {_ve}")
                 else:
-                    # 2) Heuristic: if stego looks like '<name>_stego.png', try '<name>.(png/jpg/...)'
                     stem = Path(self.stego_path).stem
                     if stem.endswith("_stego"):
                         base = stem[:-6]
-                        for ext_guess in [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff"]:
-                            guess = Path(self.stego_path).with_name(base + ext_guess)
+                        for ext_guess2 in [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff"]:
+                            guess = Path(self.stego_path).with_name(base + ext_guess2)
                             if guess.exists():
                                 try:
                                     if cover_fingerprint(guess) == hdr["cover_fp16"]:
@@ -1285,18 +1597,19 @@ class ImageDecodeTab(QWidget):
                                     pass
             except Exception as _e:
                 self.log(f"[WARN] Auto-cover lookup failed: {_e}")
-            
-            # Launch preview dialog
+
             dlg = DecodePreviewDialog(
                 stego_path=self.stego_path,
                 payload_path=str(dest),
                 payload_label=label,
                 is_text=is_text,
-                cover_path=cover_guess  # <-- NEW
+                cover_path=cover_guess
             )
             dlg.exec()
+
         except Exception as e:
             self.error(str(e))
+
 
     def log(self, msg: str):
         self.log_edit.append(msg)
