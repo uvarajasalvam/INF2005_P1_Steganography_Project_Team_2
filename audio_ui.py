@@ -1,21 +1,4 @@
 # audio_ui.py
-# Audio Steganography GUI — Encode & Decode (PySide6)
-# --------------------------------------------------
-# What this does
-# - WAV-only (PCM) steganography using LSB(s) over a selected ROI (start, length)
-# - Keyed permutation and per-byte bit rotation derived via HKDF(passphrase, salt16)
-# - Header-first layout (84 bytes) + raw payload bytes
-# - Final Key token (stg1:...) contains public params so decoder can rebuild
-#
-# Notes
-# - This implements a *self-contained* format (not compatible with steghide).
-# - No payload encryption yet (K_crypto/nonce reserved for future AEAD).
-# - cover_fp16 inside the header is informational here (binds salt during encode);
-#   at decode we don't recompute/compare it because we don't have the pristine cover.
-#
-# Run
-#   python audio_stego_gui.py
-
 import os, math, zlib, hmac, hashlib, struct, base64, wave as wave_mod
 from pathlib import Path
 
@@ -39,6 +22,57 @@ import tempfile, uuid
 # Matplotlib for waveform
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
+import soundfile as sf
+
+from typing import NamedTuple
+
+class PCM(NamedTuple):
+    samples_i16: np.ndarray   # shape (N,) for mono or (N, C) for multi
+    rate: int                 # sample rate
+    channels: int             # channel count
+    sampwidth: int            # bytes per sample (we use 2 for WAV out)
+    src_path: str             # original path
+    src_ext: str              # '.wav', '.mp3', ...
+    is_lossy: bool            # best-effort flag
+
+LOSSY_EXTS = {".mp3", ".aac", ".m4a", ".ogg", ".opus", ".wma"}
+LOSSLESS_EXTS = {".wav", ".aif", ".aiff", ".flac", ".alac"}
+
+def decode_any_to_pcm(path: str, force_mono: bool = True) -> PCM:
+    """
+    Read ANY audio using pydub/ffmpeg or soundfile fallback, return 16-bit PCM.
+    """
+    ext = Path(path).suffix.lower()
+    try:
+        # prefer pydub because it tends to be more forgiving with mp3/aac containers
+        a = AudioSegment.from_file(path)
+        if force_mono:
+            a = a.set_channels(1)
+        rate = a.frame_rate
+        ch = a.channels
+        arr = np.array(a.get_array_of_samples(), dtype=np.int16)
+        if ch > 1:
+            arr = arr.reshape(-1, ch)
+        return PCM(arr, rate, ch, 2, path, ext, ext in LOSSY_EXTS)
+    except Exception:
+        # fallback to soundfile for flac/ogg/wav (mp3 support depends on build)
+        data, rate = sf.read(path, dtype="int16", always_2d=True)  # (N, C)
+        if force_mono and data.shape[1] > 1:
+            data = data.mean(axis=1, dtype=np.int16, casting="unsafe").reshape(-1, 1)
+        ch = data.shape[1]
+        arr = data[:,0] if force_mono else data
+        return PCM(arr, rate, ch, 2, path, ext, ext in LOSSY_EXTS)
+
+def write_pcm_as_wav(out_path: str, pcm: PCM):
+    """
+    Write PCM (int16) as PCM_16 WAV.
+    """
+    samples = pcm.samples_i16
+    rate = pcm.rate
+    if samples.ndim == 1:
+        sf.write(out_path, samples, rate, format="WAV", subtype="PCM_16")
+    else:
+        sf.write(out_path, samples.astype(np.int16, copy=False), rate, format="WAV", subtype="PCM_16")
 
 # ---------- File types ----------
 AUDIO_EXTS = {".wav"}
@@ -53,11 +87,10 @@ def convert_to_wav(filepath):
 
     # Output path (same folder, but .wav extension)
     wav_path = os.path.join(folder, base + ".wav")
-
+    # works for MP3, FLAC, OGG, WAV
+    data, rate = sf.read(filepath, dtype="int16")   
     # Convert and save
-    audio = AudioSegment.from_file(filepath)
-    audio.export(wav_path, format="wav")
-
+    sf.write(wav_path, data, rate, format="WAV", subtype="PCM_16")
     return wav_path
 
 # ---------- Utils (shared) ----------
@@ -178,6 +211,29 @@ def parse_header(buf: bytes) -> ParsedHeader:
 
     return ParsedHeader(version, flags, lsb, (x0,y0,w,h), payload_len, cover_fp16, salt16, nonce12, kcheck4, crc32_read)
 
+# --- Payload Meta (TLV) ------------------------------------------------------
+def build_meta(mode: int, filename: str | None, mime: str | None) -> bytes:
+    parts = []
+    if filename:
+        b = filename.encode("utf-8")
+        parts.append(b"\x01" + struct.pack("<H", len(b)) + b)
+    if mime:
+        b = mime.encode("utf-8")
+        parts.append(b"\x02" + struct.pack("<H", len(b)) + b)
+    parts.append(b"\x03" + struct.pack("<H", 1) + bytes([mode & 0xFF]))
+    return b"".join(parts)
+
+def parse_meta(buf: bytes) -> dict:
+    i = 0; out = {"filename": None, "mime": None, "mode": 0}
+    while i + 3 <= len(buf):
+        t = buf[i]; n = struct.unpack("<H", buf[i+1:i+3])[0]; i += 3
+        v = buf[i:i+n]; i += n
+        if t == 0x01: out["filename"] = v.decode("utf-8", errors="ignore")
+        elif t == 0x02: out["mime"] = v.decode("utf-8", errors="ignore")
+        elif t == 0x03 and n >= 1: out["mode"] = int(v[0])
+    return out
+
+
 # -------------------------------
 # Final Key token helpers
 
@@ -211,9 +267,10 @@ class WaveformView(QWidget):
         self._y = None
         self._span = None
         self._press_sample = None
+        self._impact_patches = []
 
         lay = QVBoxLayout(self)
-        self.fig = Figure(figsize=(5, 2), facecolor="white")
+        self.fig = Figure(figsize=(10, 4), facecolor="white")
         self.canvas = FigureCanvasQTAgg(self.fig)
         lay.addWidget(self.canvas)
         self.ax = self.fig.add_subplot(111)
@@ -247,6 +304,7 @@ class WaveformView(QWidget):
         x = (np.arange(len(y)) * step) / self._rate
         self._x, self._y = x, y
         self.ax.clear()
+        self._clear_impacts()
         self._pretty_axes()
         self.ax.plot(self._x, self._y, linewidth=1.25, color="r")
         self.ax.set_xlim(float(self._x[0]), float(self._x[-1]))
@@ -302,9 +360,50 @@ class WaveformView(QWidget):
                 pass
             self._span = None
 
+    def _clear_impacts(self):
+        for p in self._impact_patches:
+            try: p.remove()
+            except Exception: pass
+        self._impact_patches = []
+        self.canvas.draw_idle()
+
+    def highlight_impacts(self, frames: np.ndarray, rate: int):
+        """
+        Highlight modified frame-index ranges as yellow translucent bands.
+        """
+        if rate <= 0 or frames is None or frames.size == 0:
+            self._clear_impacts()
+            return
+
+        f = np.unique(frames.astype(np.int64))
+        runs = []
+        start = f[0]; prev = f[0]
+        for x in f[1:]:
+            if x == prev + 1:
+                prev = x
+            else:
+                runs.append((start, prev))
+                start = prev = x
+        runs.append((start, prev))
+
+        # avoid drawing thousands of tiny patches
+        MAX_RUNS = 1200
+        if len(runs) > MAX_RUNS:
+            step = int(np.ceil(len(runs) / MAX_RUNS))
+            runs = runs[::step]
+
+        self._clear_impacts()
+        for a, b in runs:
+            t0 = a / rate
+            t1 = (b + 1) / rate
+            patch = self.ax.axvspan(t0, t1, color="yellow", alpha=0.25, zorder=0.5)
+            self._impact_patches.append(patch)
+        self.canvas.draw_idle()
+
     def clear(self):
         self.ax.clear()
         self._pretty_axes()
+        self._clear_impacts()
         self.canvas.draw_idle()
         self._x = self._y = None
         self._remove_span()
@@ -343,6 +442,8 @@ class WaveformView(QWidget):
         ax_stego.grid(True, alpha=0.25)
         ax_stego.spines["top"].set_visible(False)
         ax_stego.spines["right"].set_visible(False)
+
+        self.ax = ax_stego
 
         self.canvas.draw_idle()
 
@@ -700,42 +801,48 @@ class AudioEncodeTab(QWidget):
     # ----- GUI reactions
     def load_cover(self, path: str):
         try:
-            ext = Path(path).suffix.lower()
-            if ext not in SUPPORTED_AUDIO_EXTS:
-                raise ValueError("Unsupported audio format.")
-            # keep original path for fingerprinting (so token binds to original file)
+            if not os.path.isfile(path):
+                raise ValueError("File not found.")
+            pcm = decode_any_to_pcm(path, force_mono=True)  # mono for waveform; bytes I/O remains below
+
+            # store originals
             self.orig_cover_path = path
+            self.cover_path = path
+            self.pcm_meta = pcm  # keep around for warnings
 
-            # convert to WAV if needed (returns same path for WAV)
-            wav_path = convert_to_wav(path)
-            self.cover_path = wav_path
+            # For all embedding and capacity math we still use WAV bytes
+            # Convert the same input to a temp WAV path for raw-byte embedding
+            tmp_wav = str(Path(tempfile.gettempdir()) / f"{Path(path).stem}_{uuid.uuid4().hex}.wav")
+            write_pcm_as_wav(tmp_wav, pcm)
+            self.wav_for_embed = tmp_wav   # <-- use this file for _read_wav_* later
 
-            samples_mono, rate, info = self._read_wav_mono(wav_path)
+            info = {
+                "frames": len(pcm.samples_i16),
+                "channels": 1,   # we forced mono for the view; bytes path still uses real channels via WAV bytes
+                "sampwidth": 2,
+                "rate": pcm.rate
+            }
             self.audio_info = info
+
+            # UI text
+            lossy_note = " (lossy source)" if pcm.is_lossy else ""
             self.cover_info.setText(
-                f"Path: {path}\nWAV {info['channels']}ch @ {info['rate']}Hz, {info['sampwidth'] * 8}-bit, frames={info['frames']}"
+                f"Path: {path}\nDecoded to WAV mono for view @ {info['rate']}Hz, 16-bit, frames={info['frames']}{lossy_note}"
             )
 
-            # set UI controls based on the WAV we will embed into
-            self.audio_start.blockSignals(True);
-            self.audio_len.blockSignals(True)
-            self.audio_start.setRange(0, max(0, info["frames"] - 1));
-            self.audio_start.setValue(0)
-            self.audio_len.setRange(1, info["frames"]);
-            self.audio_len.setValue(info["frames"])
-            self.audio_start.blockSignals(False);
-            self.audio_len.blockSignals(False)
+            # configure controls
+            self.audio_start.blockSignals(True); self.audio_len.blockSignals(True)
+            self.audio_start.setRange(0, max(0, info["frames"] - 1)); self.audio_start.setValue(0)
+            self.audio_len.setRange(1, info["frames"]); self.audio_len.setValue(info["frames"])
+            self.audio_start.blockSignals(False); self.audio_len.blockSignals(False)
 
             total_dur = info["frames"] / info["rate"] if info["rate"] > 0 else 0.0
             min_dur = 1.0 / info["rate"] if info["rate"] > 0 else 0.001
-            self.start_sec.blockSignals(True);
-            self.len_sec.blockSignals(True)
+            self.start_sec.blockSignals(True); self.len_sec.blockSignals(True)
             self.start_sec.setRange(0.0, max(0.0, total_dur))
             self.len_sec.setRange(min_dur, max(min_dur, total_dur))
-            self.start_sec.setValue(0.0);
-            self.len_sec.setValue(max(min_dur, total_dur))
-            self.start_sec.blockSignals(False);
-            self.len_sec.blockSignals(False)
+            self.start_sec.setValue(0.0); self.len_sec.setValue(max(min_dur, total_dur))
+            self.start_sec.blockSignals(False); self.len_sec.blockSignals(False)
 
             self.time_slider.blockSignals(True)
             self.time_slider.setRange(0, max(0, info["frames"] - 1))
@@ -743,15 +850,24 @@ class AudioEncodeTab(QWidget):
             self.time_slider.setValue(0)
             self.time_slider.blockSignals(False)
 
-            self.lbl_time_left.setText("0:00");
+            self.lbl_time_left.setText("0:00")
             self.lbl_time_right.setText(fmt_time(info["frames"], info["rate"]))
             self.lbl_time_cur.setText("0:00")
-            self.wave.set_audio(samples_mono, rate)
+
+            # waveform uses the *mono* PCM we decoded above
+            mono = pcm.samples_i16 if pcm.samples_i16.ndim == 1 else pcm.samples_i16[:,0]
+            self.wave.set_audio(mono, pcm.rate)
             self.wave.set_selection(self.audio_start.value(), self.audio_len.value())
-            self.update_capacity_label();
+            self.update_capacity_label()
+
+            # helpful warning if source is lossy
+            if pcm.is_lossy:
+                self.log("[WARN] Source is a lossy codec. LSB payload will NOT survive re-encoding or normalization. Keep the stego .wav as-is.")
+
             self.log(f"Loaded audio: {path}")
         except Exception as e:
             self.error(str(e))
+
 
     def _on_wave_selection(self, start_sample: int, length: int):
         if self.audio_info:
@@ -864,12 +980,21 @@ class AudioEncodeTab(QWidget):
             kd = kdf_from_key(key, salt16)
             K_perm, K_bit, K_crypto, K_check, nonce = kd["K_perm"], kd["K_bit"], kd["K_crypto"], kd["K_check"], kd[
                 "nonce"]
+            
+            # Decide mode + meta
+            mode = 0 if self.payload_panel.mode() == "text" else 1
+            fname = None
+            if mode == 1 and self.payload_panel.payload_path:
+                fname = os.path.basename(self.payload_panel.payload_path)
+            meta = build_meta(mode, fname, None)
+            meta_len_bytes = struct.pack("<I", len(meta))
+
             header = build_header(1, lsb, roi, len(payload), cover_id, salt16, nonce, K_check)
-            token = make_key_token("audio", lsb, roi, salt16, K_check)
+            token  = make_key_token("audio", lsb, roi, salt16, K_check)
             self.key_token_edit.setText(token)
 
             # Read original WAV
-            raw_u8, params = self._read_wav_bytes(self.cover_path)
+            raw_u8, params = self._read_wav_bytes(self.wav_for_embed)
             tgt = self._target_byte_indices(params, start, length)
             total_bits = (len(header) + len(payload)) * 8
             capacity_bits = len(tgt) * lsb
@@ -881,16 +1006,35 @@ class AudioEncodeTab(QWidget):
             rng = Generator(PCG64(rng_seed))
             perm = rng.permutation(len(tgt))
             tgt_perm = tgt[perm]
-            bit_groups = self._bit_chunks(header + payload, lsb)
+            bit_groups = self._bit_chunks(header + meta_len_bytes + meta + payload, lsb)  # <-- include meta
+
             kbit_byte = K_bit[0]
+
+            # How many target BYTES are used by this embedding?
+            used_targets = int(math.ceil(total_bits / lsb))
+
+            # Byte indices touched (permuted order)
+            impacted_byte_idx = tgt_perm[:used_targets]
+
+            # Map byte index -> frame index
+            C = params["channels"]; B = params["sampwidth"]
+            bytes_per_frame = C * B
+            impacted_frames = (impacted_byte_idx // bytes_per_frame).astype(np.int64)
+
+            # Draw yellow bands on the waveform
+            self.wave.highlight_impacts(impacted_frames, params["rate"])
+
             self._embed_bits_into_bytes(raw_u8, tgt_perm, bit_groups, lsb, kbit_byte)
 
-            stem = Path(self.cover_path).with_suffix("")
+            stem = Path(self.orig_cover_path).with_suffix("")
             out_path = str(stem) + "_stego.wav"
+            if getattr(self, "pcm_meta", None) and self.pcm_meta.is_lossy:
+                self.log("[NOTE] Output is .wav because LSB requires PCM. Do not convert this stego.wav back to MP3/AAC if you plan to decode later.")
+
             self._write_wav_bytes(out_path, params, raw_u8)
 
             # --- Display waveform and overlay comparison ---
-            orig_samples, rate, _ = self._read_wav_mono(self.cover_path)
+            orig_samples, rate, _ = self._read_wav_mono(self.wav_for_embed)
             stego_samples, _, _ = self._read_wav_mono(out_path)
 
             # Show stego waveform
@@ -900,6 +1044,8 @@ class AudioEncodeTab(QWidget):
             # Overlay original and stego
             if hasattr(self.wave, "set_comparison"):
                 self.wave.set_comparison(orig_samples, stego_samples)
+                # re-apply highlight because set_comparison recreates axes
+                self.wave.highlight_impacts(impacted_frames, params["rate"])
 
             # Optional numeric comparison
             diff = np.abs(orig_samples.astype(np.int32) - stego_samples.astype(np.int32))
@@ -1080,14 +1226,15 @@ class AudioDecodeTab(QWidget):
         except Exception as e:
             self.error(str(e))
 
-    def convert_to_wav(path_in: str) -> str:
+    def convert_to_wav(self, path_in: str) -> str:
         """If input is already WAV, return it. Otherwise convert to a temp WAV and return path."""
         ext = Path(path_in).suffix.lower()
         if ext == ".wav":
             return path_in
-        audio = AudioSegment.from_file(path_in)  # requires ffmpeg available
         tmp = Path(tempfile.gettempdir()) / f"{Path(path_in).stem}_{uuid.uuid4().hex}.wav"
-        audio.export(str(tmp), format="wav")
+        data, rate = sf.read(path_in, dtype="int16")
+        sf.write(str(tmp), data, rate, format="WAV", subtype="PCM_16")
+        self._tmp_wav = str(tmp)
         return str(tmp)
 
     def on_decode(self):
@@ -1115,26 +1262,48 @@ class AudioDecodeTab(QWidget):
             if ph.lsb != lsb or ph.roi != roi:
                 raise ValueError("Token/controls do not match embedded header")
             # 2) Extract payload
-            need_bits = ph.payload_len * 8
-            total_needed = HEADER_TOTAL_LEN*8 + need_bits
-            if capacity_bits < total_needed:
-                raise ValueError("ROI capacity too small for embedded payload")
-            # We already consumed header_bits from the start of tgt_perm. Continue from there:
-            # For simplicity, re-extract total_needed and slice (cheap and deterministic)
+            need_bits_meta_len = 4 * 8
+            total_needed_so_far = HEADER_TOTAL_LEN*8 + need_bits_meta_len
+            all_bits = self._extract_bits(raw_u8, tgt_perm, total_needed_so_far, lsb, K_bit[0])
+            meta_len_bytes = self._bits_to_bytes(all_bits[HEADER_TOTAL_LEN*8 : total_needed_so_far])
+            (meta_len,) = struct.unpack("<I", meta_len_bytes)
+
+            # --- now read meta blob + payload
+            need_bits_rest = (meta_len + ph.payload_len) * 8
+            total_needed = total_needed_so_far + need_bits_rest
             all_bits = self._extract_bits(raw_u8, tgt_perm, total_needed, lsb, K_bit[0])
-            payload_bits = all_bits[HEADER_TOTAL_LEN*8: HEADER_TOTAL_LEN*8 + need_bits]
+
+            offset = HEADER_TOTAL_LEN*8 + need_bits_meta_len
+            meta_bits = all_bits[offset : offset + meta_len*8]
+            payload_bits = all_bits[offset + meta_len*8 : offset + meta_len*8 + ph.payload_len*8]
+
+            meta = parse_meta(self._bits_to_bytes(meta_bits))
             payload_bytes = self._bits_to_bytes(payload_bits)
-            # Try UTF-8 display; otherwise offer to save
-            try:
-                text = payload_bytes.decode("utf-8")
-                self.log(f"Decoded text payload ({len(payload_bytes)} bytes):\n{text}")
-                QMessageBox.information(self, "Decode", f"Extracted text payload ({len(payload_bytes)} bytes). See Log.")
-            except UnicodeDecodeError:
-                # ask where to save
-                out_path, _ = QFileDialog.getSaveFileName(self, "Save payload as…", "payload.bin")
+
+            mode = meta.get("mode", 0)
+            fname = meta.get("filename") or "payload.bin"
+
+            if mode == 0:
+                # text
+                try:
+                    text = payload_bytes.decode("utf-8")
+                    self.log(f"Decoded text payload ({len(payload_bytes)} bytes):\n{text}")
+                    QMessageBox.information(self, "Decode", f"Extracted text payload ({len(payload_bytes)} bytes). See Log.")
+                except UnicodeDecodeError:
+                    # fallback to saving as file
+                    out_path, _ = QFileDialog.getSaveFileName(self, "Save text-as-binary…", fname)
+                    if out_path:
+                        with open(out_path, "wb") as f: f.write(payload_bytes)
+                        self.log(f"Saved payload to: {out_path} ({len(payload_bytes)} bytes)")
+                    else:
+                        self.log("[INFO] Save canceled.")
+            else:
+                # file mode: propose original name
+                default = fname
+                out_path, _ = QFileDialog.getSaveFileName(self, "Save payload as…", default)
                 if out_path:
                     with open(out_path, "wb") as f: f.write(payload_bytes)
-                    self.log(f"Saved binary payload to: {out_path} ({len(payload_bytes)} bytes)")
+                    self.log(f"Saved binary payload: {out_path} ({len(payload_bytes)} bytes)")
                     QMessageBox.information(self, "Decode", f"Binary payload saved ({len(payload_bytes)} bytes).")
                 else:
                     self.log("[INFO] Binary payload not saved (user canceled).")
