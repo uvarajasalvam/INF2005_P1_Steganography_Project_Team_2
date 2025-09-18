@@ -4,7 +4,7 @@ from pathlib import Path
 
 from numpy.random import PCG64, Generator
 from PySide6.QtGui import QPixmap, QMovie
-from PIL import Image, ImageSequence
+from PIL import Image
 
 from PySide6.QtCore import Qt, QRect, Signal
 import PySide6.QtCore as QtCore
@@ -21,19 +21,6 @@ from PySide6.QtWidgets import (
 IMAGE_EXTS = {".bmp", ".png", ".gif", ".jpg", ".jpeg"}
 
 # ---------- Utils (shared) ----------
-def _choose_output_path(cover_path: str) -> tuple[str, str]:
-    """
-    Return (out_path, out_format). Keep source format, except JPEG->PNG (lossless).
-    """
-    p = Path(cover_path)
-    ext = p.suffix.lower()
-    if ext in {".jpg", ".jpeg"}:
-        return str(p.with_suffix("")) + "_stego.png", "PNG"
-    if ext == ".gif":
-        return str(p.with_suffix("")) + "_stego.gif", "GIF"
-    # keep original for bmp/png/webp/tif/tiff/ico where Pillow can save lossless
-    return str(p.with_suffix("")) + f"_stego{ext}", (ext[1:]).upper()
-
 def human_bytes(n: int) -> str:
     if n < 1024:
         return f"{n} B"
@@ -137,9 +124,8 @@ def parse_key_token(token: str) -> dict:
 # ---------- Stego helpers ----------
 def _ensure_8bit_mode(pil_img: Image.Image) -> tuple[Image.Image, int, str]:
     """
-    Ensure image is 8-bit per channel or 8-bit palette.
-    Return (converted_img, channels, mode).
-    We support L, RGB, RGBA, and P (palette-indexed).
+    Ensure image is 8-bit per channel. Return (converted_img, channels, mode).
+    We support L, RGB, RGBA. Convert other modes to RGB.
     """
     mode = pil_img.mode
     if mode == "L":
@@ -148,9 +134,7 @@ def _ensure_8bit_mode(pil_img: Image.Image) -> tuple[Image.Image, int, str]:
         return pil_img, 3, "RGB"
     if mode == "RGBA":
         return pil_img, 4, "RGBA"
-    if mode == "P":  # GIF frames
-        return pil_img, 1, "P"
-    # Others → RGB
+    # Palette or others → RGB
     return pil_img.convert("RGB"), 3, "RGB"
 
 def _img_bytes_and_geometry(img: Image.Image) -> tuple[bytearray, int, int, int]:
@@ -158,59 +142,6 @@ def _img_bytes_and_geometry(img: Image.Image) -> tuple[bytearray, int, int, int]
     conv, ch, _ = _ensure_8bit_mode(img)
     w, h = conv.size
     return bytearray(conv.tobytes()), w, h, ch
-
-def _save_gif_with_modified_first_frame(
-    src_path: str,
-    first_frame_mode: str,
-    size_wh: tuple[int,int],
-    modified_buf: bytes
-) -> str:
-    """
-    Save an animated (or static) GIF where only frame 0 bytes are modified.
-    We keep original palette, durations, loop, transparency, disposal.
-    We DO NOT optimize or quantize so index LSBs survive.
-    """
-    im = Image.open(src_path)
-
-    # Collect frames + metadata
-    frames = [frame.copy() for frame in ImageSequence.Iterator(im)]
-    durations = [getattr(f, "info", {}).get("duration", im.info.get("duration", 0)) for f in frames]
-    loop = im.info.get("loop", 0)
-    transparency = im.info.get("transparency", None)
-    disposal = [getattr(f, "disposal_method", getattr(f.info, "get", lambda *_: None)("disposal", None)) for f in frames]
-    # Note: Pillow uses "disposal" kw from 9.x; older versions may ignore it. It's ok.
-
-    # Build modified frame 0 in 'P' with original palette
-    w, h = size_wh
-    if first_frame_mode != "P":
-        # Safety: we only call this for 'P' frames
-        raise ValueError("GIF saver expects mode 'P' for the first frame.")
-    pal = frames[0].getpalette()
-    f0 = Image.frombytes("P", (w, h), modified_buf)
-    if pal: f0.putpalette(pal)
-
-    # Ensure sizes match (GIF expects consistent logical screen)
-    for i in range(1, len(frames)):
-        if frames[i].size != (w, h):
-            frames[i] = frames[i].convert("P")
-            frames[i] = frames[i].resize((w, h), Image.NEAREST)
-            if pal: frames[i].putpalette(pal)
-
-    # Save
-    out_path = str(Path(src_path).with_suffix("")) + "_stego.gif"
-    save_kwargs = dict(
-        save_all=True,
-        append_images=frames[1:] if len(frames) > 1 else [],
-        duration=durations if len(frames) > 1 else durations[0] if durations else 0,
-        loop=loop,
-        optimize=False,   # <- important: do not re-quantize/re-map
-        disposal=disposal if any(d is not None for d in disposal) else None
-    )
-    if transparency is not None:
-        save_kwargs["transparency"] = transparency
-
-    f0.save(out_path, format="GIF", **{k:v for k,v in save_kwargs.items() if v is not None})
-    return out_path
 
 def _pixel_byte_index(x: int, y: int, c: int, width: int, channels: int) -> int:
     return (y*width + x)*channels + c
@@ -1065,25 +996,9 @@ class ImageEncodeTab(QWidget):
                 i_bit += 1
 
             # Write stego as PNG (lossless). Warn if source was JPEG.
-            out_path, out_fmt = _choose_output_path(self.cover_path)
-
-            if out_fmt == "GIF":
-                # We embedded into the current frame bytes.
-                # For GIF we must keep palette indices in 'P' mode so decoding works.
-                if mode != "P":
-                    # For safety: if a GIF got converted elsewhere (shouldn't if change #1 is in),
-                    # refuse instead of silently corrupting
-                    raise ValueError("GIF encode path requires palette-indexed ('P') mode.")
-                out_path = _save_gif_with_modified_first_frame(
-                    src_path=self.cover_path,
-                    first_frame_mode=mode,
-                    size_wh=(imgW, imgH),
-                    modified_buf=bytes(buf)
-                )
-            else:
-                # Non-GIF (PNG/BMP/WEBP/etc). Keep your existing path (lossless).
-                Image.frombytes(mode, (imgW, imgH), bytes(buf)).save(out_path, format=out_fmt)
-                        
+            out_path = str(Path(self.cover_path).with_suffix("")) + "_stego.png"
+            Image.frombytes(mode, (imgW, imgH), bytes(buf)).save(out_path, format="PNG")
+            
             # NEW: write sidecar meta with absolute cover path for auto-load during decode
             try:
                 meta_path = Path(out_path).with_suffix(".meta")
