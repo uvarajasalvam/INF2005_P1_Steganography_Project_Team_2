@@ -17,9 +17,13 @@ from PySide6.QtWidgets import (
     QFileDialog, QLineEdit, QFormLayout, QTabWidget, QSplitter, QFrame,
     QMessageBox, QTextEdit, QRubberBand, QSlider
 )
+import fitz  # PyMuPDF
 
 # ---------- File types ----------
-IMAGE_EXTS = {".bmp", ".png", ".gif", ".jpg", ".jpeg"}
+IMAGE_EXTS = {
+    ".bmp", ".png", ".gif", ".jpg", ".jpeg",
+    ".tif", ".tiff", ".webp", ".ico", ".pdf"
+}
 
 # ---------- Utils (shared) ----------
 def human_bytes(n: int) -> str:
@@ -123,6 +127,112 @@ def parse_key_token(token: str) -> dict:
     return {"media_kind": media_kind, "lsb": lsb, "roi": (x0,y0,w,h), "salt16": salt16, "kcheck4": kcheck4}
 
 # ---------- Stego helpers ----------
+def pil_to_qpixmap(img: Image.Image) -> QPixmap:
+    # Convert a PIL Image to QPixmap for preview
+    data = img.convert("RGBA").tobytes("raw", "RGBA")
+    qimg = QtGui.QImage(data, img.width, img.height, QtGui.QImage.Format_RGBA8888)
+    return QPixmap.fromImage(qimg)
+
+def save_pdf_with_replaced_page(src_pdf: str, page_index: int, pil_image: Image.Image, dest_pdf: str):
+    if fitz is None:
+        raise RuntimeError("PyMuPDF (fitz) is required for PDF support. Please install with: pip install pymupdf")
+
+    # Flatten to RGB to avoid soft-mask creation in PDF
+    if pil_image.mode != "RGB":
+        pil_image = pil_image.convert("RGB")
+
+    buf = io.BytesIO()
+    pil_image.save(buf, format="PNG", optimize=False)  # lossless PNG, no alpha
+    img_bytes = buf.getvalue()
+
+    doc = fitz.open(src_pdf)
+    if page_index < 0 or page_index >= len(doc):
+        doc.close()
+        raise ValueError(f"Page index {page_index+1} out of range (1..{len(doc)})")
+
+    page = doc[page_index]
+    rect = page.rect
+    page.clean_contents()
+    page.insert_image(rect, stream=img_bytes, keep_proportion=False)  # full-page cover
+    doc.save(dest_pdf)
+    doc.close()
+
+
+
+def render_pdf_page_to_pil(pdf_path: str, page_index: int, dpi: int = 200) -> tuple[Image.Image, tuple[int,int]]:
+    if fitz is None:
+        raise RuntimeError("PyMuPDF (fitz) is required for PDF support. Please install with: pip install pymupdf")
+
+    doc = fitz.open(pdf_path)
+    if page_index < 0 or page_index >= len(doc):
+        doc.close()
+        raise ValueError(f"Page index {page_index+1} out of range (1..{len(doc)})")
+
+    page = doc[page_index]
+    zoom = dpi / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, alpha=False)  # <-- IMPORTANT: alpha=False (opaque RGB)
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)  # <-- RGB, no alpha
+    doc.close()
+    return img, (pix.width, pix.height)
+
+def choose_stego_path_and_params(cover_path: str) -> tuple[Path, str, dict]:
+    """
+    Decide the stego output path/format/kwargs based on the cover file type.
+    We keep the same type when it is lossless or can be saved losslessly.
+    JPEG is forced to PNG to preserve hidden bits.
+    Returns: (out_path, pil_format, save_kwargs)
+    """
+    p = Path(cover_path)
+    stem = p.stem
+    ext = p.suffix.lower()
+
+    # Defaults
+    fmt = "PNG"
+    save_kwargs: dict = {}
+
+    if ext in {".png"}:
+        fmt = "PNG"; out = p.with_name(f"{stem}_stego.png")
+    elif ext in {".bmp"}:
+        fmt = "BMP"; out = p.with_name(f"{stem}_stego.bmp")
+    elif ext in {".tif", ".tiff"}:
+        # Lossless TIFF (LZW or Deflate). LZW is widely compatible.
+        fmt = "TIFF"; out = p.with_name(f"{stem}_stego.tif")
+        save_kwargs = {"compression": "tiff_lzw"}
+    elif ext in {".webp"}:
+        # Ensure lossless, otherwise LSBs are lost.
+        fmt = "WEBP"; out = p.with_name(f"{stem}_stego.webp")
+        save_kwargs = {"lossless": True, "method": 6}
+    elif ext in {".ico"}:
+        # ICO saving can resample/simplify; safer to switch to PNG.
+        fmt = "PNG"; out = p.with_name(f"{stem}_stego.png")
+    elif ext in {".jpg", ".jpeg"}:
+        # JPEG is lossy; ALWAYS switch to PNG (or lossless WebP/TIFF if you prefer).
+        fmt = "PNG"; out = p.with_name(f"{stem}_stego.png")
+    else:
+        # Unknown/less common → safe default
+        fmt = "PNG"; out = p.with_name(f"{stem}_stego.png")
+
+    return out, fmt, save_kwargs
+
+def get_source_dir() -> Path:
+    """
+    Return the project's 'source' directory, creating it if missing.
+    We search upward from this file's directory for a folder named 'source'.
+    If not found, we create one next to this file.
+    """
+    here = Path(__file__).resolve()
+    # Search current dir and parents for an existing 'source'
+    for p in [here.parent, *here.parents]:
+        cand = p / "source"
+        if cand.is_dir():
+            cand.mkdir(parents=True, exist_ok=True)
+            return cand
+    # Fallback: create 'source' next to this file
+    fallback = here.parent / "source"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
 def _embed_bits_gif(frame_bufs, imgW, imgH, roi, lsb, K_perm, K_bit,
                     bitstream: list[int], palette: list[int]) -> None:
     """
@@ -487,36 +597,71 @@ def _is_mostly_text(b: bytes) -> bool:
 
 def guess_image_or_text_ext(data: bytes) -> tuple[str, str, bool]:
     """
-    Return (ext, label, is_text). Prioritize image signatures over text.
+    Return (ext, label, is_text). Prioritize concrete magic bytes over text.
+    Covers common images, audio, video/containers, docs, and archives.
     """
     sig = data[:16]
+    head256 = data[:256].lstrip()
 
-    # --- images (magic bytes) ---
-    if sig.startswith(b"\x89PNG\r\n\x1a\n"):
-        return ".png", "PNG image", False
-    if sig.startswith(b"\xff\xd8\xff"):
-        return ".jpg", "JPEG image", False
+    # ---------- Images ----------
+    if sig.startswith(b"\x89PNG\r\n\x1a\n"):           return ".png",  "PNG image", False
+    if sig.startswith(b"\xff\xd8\xff"):                return ".jpg",  "JPEG image", False
     if sig.startswith(b"GIF87a") or sig.startswith(b"GIF89a"):
-        return ".gif", "GIF image", False
-    if sig.startswith(b"BM"):
-        return ".bmp", "BMP image", False
-    if sig.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP":
-        return ".webp", "WebP image", False
+                                                       return ".gif",  "GIF image", False
+    if sig.startswith(b"BM"):                          return ".bmp",  "BMP image", False
     if sig.startswith(b"II*\x00") or sig.startswith(b"MM\x00*"):
-        return ".tif", "TIFF image", False
-    if len(sig) >= 4 and sig[:4] == b"\x00\x00\x01\x00":
-        return ".ico", "ICO image", False
+                                                       return ".tif",  "TIFF image", False
+    if sig[:4] == b"\x00\x00\x01\x00":                 return ".ico",  "ICO image", False
+    if sig.startswith(b"RIFF") and len(sig) >= 12 and sig[8:12] == b"WEBP":
+                                                       return ".webp", "WebP image", False
+    # SVG (XML/text)
+    if head256.startswith(b"<svg") or (head256.startswith(b"<?xml") and b"<svg" in head256[:256]):
+                                                       return ".svg",  "SVG image", True
 
-    # SVG (XML/text). Check early bytes for '<svg' or xml with svg
-    head = data[:256].lstrip()
-    if head.startswith(b"<svg") or (head.startswith(b"<?xml") and b"<svg" in head[:256]):
-        return ".svg", "SVG image", True  # text-based image
+    # ---------- Audio ----------
+    # WAV/RIFF WAVE
+    if sig.startswith(b"RIFF") and len(sig) >= 12 and sig[8:12] == b"WAVE":
+                                                       return ".wav",  "WAV audio", False
+    # AIFF/AIFFC
+    if sig.startswith(b"FORM") and len(sig) >= 12 and sig[8:12] in (b"AIFF", b"AIFC"):
+                                                       return ".aiff", "AIFF audio", False
+    # FLAC
+    if sig.startswith(b"fLaC"):                        return ".flac", "FLAC audio", False
+    # Ogg (Vorbis/Opus/etc.)
+    if sig.startswith(b"OggS"):                        return ".ogg",  "Ogg audio/container", False
+    # MP3: ID3 tag or MPEG frame sync (heuristic)
+    if sig.startswith(b"ID3"):                         return ".mp3",  "MP3 audio", False
+    if len(sig) >= 2 and sig[0] == 0xFF and (sig[1] & 0xE0) == 0xE0:
+                                                       return ".mp3",  "MP3 audio (frame sync)", False
+    # AAC ADTS (very heuristic)
+    if len(sig) >= 2 and sig[0] == 0xFF and (sig[1] & 0xF6) == 0xF0:
+                                                       return ".aac",  "AAC audio", False
+    # MP4/M4A family (ISO BMFF)
+    if len(data) >= 12 and data[4:12] == b"ftypM4A ":  return ".m4a",  "M4A audio", False
+    if len(data) >= 12 and data[4:8] == b"ftyp":       return ".mp4",  "MP4/ISO media", False
 
-    # --- text (UTF-8) ---
-    if _is_mostly_text(data):
-        return ".txt", "UTF-8 text", True
+    # ---------- Documents ----------
+    if sig.startswith(b"%PDF-"):                       return ".pdf",  "PDF document", False
+    # Plain text (UTF-8) — check before JSON/CSV so they get .txt if not clearly JSON/CSV
+    if _is_mostly_text(data):                          return ".txt",  "UTF-8 text", True
+    # JSON (simple heuristic)
+    if head256[:1] in (b"{", b"["):                   return ".json", "JSON text", True
+    # XML (non-SVG)
+    if head256.startswith(b"<?xml"):                   return ".xml",  "XML document", True
+    # CSV/TSV quick sniff
+    if b"," in head256 and b"\n" in head256:          return ".csv",  "CSV text", True
+    if b"\t" in head256 and b"\n" in head256:         return ".tsv",  "TSV text", True
 
-    # unknown
+    # ---------- Archives / binaries ----------
+    if sig.startswith(b"PK\x03\x04"):                  return ".zip",  "ZIP archive", False
+    if sig.startswith(b"7z\xBC\xAF\x27\x1C"):          return ".7z",   "7z archive", False
+    if sig.startswith(b"Rar!\x1A\x07\x00"):            return ".rar",  "RAR archive (v1.5)", False
+    if sig.startswith(b"Rar!\x1A\x07\x01\x00"):        return ".rar",  "RAR archive (v5)", False
+    if sig.startswith(b"\x1F\x8B\x08"):                return ".gz",   "Gzip data", False
+    if sig.startswith(b"BZh"):                         return ".bz2",  "Bzip2 data", False
+    if sig.startswith(b"\xfd7zXZ\x00"):                return ".xz",   "XZ compressed data", False
+
+    # Fallback
     return ".bin", "Unknown binary", False
 
 # ---------- Widgets ----------
@@ -915,7 +1060,7 @@ class DecodePreviewDialog(QtWidgets.QDialog):
                 return
 
         # Image preview
-        if Path(self.payload_path).suffix.lower() in {".png",".jpg",".jpeg",".gif",".bmp",".webp",".tif",".tiff",".ico"}:
+        if Path(self.payload_path).suffix.lower() in IMAGE_EXTS:
             try:
                 self._load_any_image(self.payload_img, self.payload_path)
                 self.payload_stack.setCurrentIndex(1)
@@ -1124,6 +1269,51 @@ class ImageEncodeTab(QWidget):
 
         main = QVBoxLayout(self); main.addWidget(splitter)
 
+        # --- PDF page controls (hidden by default) ---
+        self.pdf_path: str | None = None
+        self.pdf_page_count: int = 0
+        self.pdf_page_index: int = 0  # 0-based
+
+        self.page_slider = QSlider(Qt.Horizontal)
+        self.page_slider.setRange(1, 1)
+        self.page_slider.setValue(1)
+        self.page_slider.setVisible(False)
+
+        self.page_value = QLabel("1")
+        self.page_value.setVisible(False)
+
+        self.page_slider.valueChanged.connect(lambda v: self._on_pdf_page_changed(v))
+        prow = QHBoxLayout(); prow.addWidget(self.page_slider, 1); prow.addWidget(self.page_value, 0)
+        prow_wrap = QWidget(); prow_wrap.setLayout(prow)
+        form.addRow("Page:", prow_wrap)  # put after the "Number of LSBs" row
+
+    def _on_pdf_page_changed(self, v: int):
+    # v is 1-based for UI; store 0-based
+        self.pdf_page_index = max(0, v - 1)
+        self.page_value.setText(str(v))
+        # Re-render preview of the chosen page
+        try:
+            if self.pdf_path:
+                pil_img, (pw, ph) = render_pdf_page_to_pil(self.pdf_path, self.pdf_page_index)
+                qpix = pil_to_qpixmap(pil_img)
+                self.cover_qpix = qpix
+                self.cover_view.setImage(qpix)
+                # update capacity info using this raster’s geometry
+                self.img_info = {
+                    "size": (pw, ph),
+                    "mode": pil_img.mode,
+                    "bands": len(pil_img.getbands()),
+                    "n_frames": 1,
+                    "format": "PDF(page)",
+                }
+                self.roi_img = None
+                self.cap_label.setText("Select ROI to evaluate capacity.")
+                self.update_capacity_label()
+            else:
+                pass
+        except Exception as e:
+            self.error(f"Failed to render PDF page: {e}")
+
     def copy_key_token(self):
         QtGui.QGuiApplication.clipboard().setText(self.key_token_edit.text())
         QMessageBox.information(self, "Copied", "Final Key copied to clipboard.")
@@ -1131,12 +1321,59 @@ class ImageEncodeTab(QWidget):
     def load_cover(self, path: str):
         try:
             ext = Path(path).suffix.lower()
-            if ext not in IMAGE_EXTS:
+            if ext not in IMAGE_EXTS and ext != ".pdf":
                 raise ValueError("Unsupported image format.")
 
-            self.cover_path = path
+            # ---------- PDF branch ----------
+            if ext == ".pdf":
+                if fitz is None:
+                    raise RuntimeError("PyMuPDF (fitz) is required for PDF support. Install with: pip install pymupdf")
 
+                self.cover_path = path
+                self.pdf_path = path
+
+                # Open PDF to get page count
+                doc = fitz.open(path)
+                self.pdf_page_count = len(doc)
+                doc.close()
+
+                # Show/enable page controls
+                self.page_slider.setVisible(True)
+                self.page_value.setVisible(True)
+                self.page_slider.setRange(1, max(1, self.pdf_page_count))
+                self.page_slider.setValue(1)
+                self.pdf_page_index = 0  # 0-based
+
+                # Render first page for preview
+                pil_img, (pw, ph) = render_pdf_page_to_pil(path, 0)
+                self.cover_qpix = pil_to_qpixmap(pil_img)
+                self.cover_view.setImage(self.cover_qpix)
+
+                # Record img_info for capacity math
+                self.img_info = {
+                    "size": (pw, ph),
+                    "mode": pil_img.mode,
+                    "bands": len(pil_img.getbands()),
+                    "n_frames": 1,
+                    "format": "PDF(page)",
+                }
+
+                self.cover_info.setText(
+                    f"Path: {path}\nFormat: PDF, Pages: {self.pdf_page_count}\n"
+                    f"Showing page 1 at preview DPI"
+                )
+
+                # Reset ROI/capacity UI
+                self.roi_img = None
+                self.cap_label.setText("Select ROI to evaluate capacity.")
+                self.update_capacity_label()
+                self.log(f"Loaded PDF: {path} (pages: {self.pdf_page_count})")
+                return
+
+            # ---------- GIF branch (existing) ----------
             if ext == ".gif":
+                self.cover_path = path
+
                 # --- Animated preview via QMovie (UI only) ---
                 movie = QMovie(path)
                 if not movie.isValid():
@@ -1161,10 +1398,8 @@ class ImageEncodeTab(QWidget):
                 try:
                     from PIL import ImageSequence
                     for frame in ImageSequence.Iterator(im):
-                        # Do NOT call frame.putpalette(...) here — some frames are not 'P'
                         durations.append(frame.info.get("duration", im.info.get("duration", 100)))
                 except Exception:
-                    # Fallback: use container-level duration if available
                     durations = [im.info.get("duration", 100)] * max(1, n_frames)
 
                 if not durations:
@@ -1190,25 +1425,40 @@ class ImageEncodeTab(QWidget):
                 )
                 self.log("Loaded GIF (animated). Preview shows animation; ROI applies to canvas area.")
 
-            else:
-                # --- Static preview via QPixmap ---
-                qpix = QPixmap(path)
-                if qpix.isNull():
-                    raise ValueError("Failed to load image.")
-                self.cover_qpix = qpix
-                self.cover_view.setImage(qpix)
+                # Hide PDF page controls (in case a PDF was loaded earlier)
+                self.page_slider.setVisible(False)
+                self.page_value.setVisible(False)
 
-                im = Image.open(path)
-                self.img_info = {
-                    "size": im.size,
-                    "mode": im.mode,
-                    "bands": len(im.getbands()),
-                    "n_frames": 1,
-                    "format": im.format or ext.upper().lstrip("."),
-                }
-                self.cover_info.setText(
-                    f"Path: {path}\nFormat: {im.format}, Mode: {im.mode}, Size: {im.size[0]}x{im.size[1]}"
-                )
+                # Reset ROI/capacity UI
+                self.roi_img = None
+                self.cap_label.setText("Select ROI to evaluate capacity.")
+                self.update_capacity_label()
+                self.log(f"Loaded image: {path}")
+                return
+
+            # ---------- Static image branch (existing) ----------
+            # Hide PDF page controls (in case a PDF was loaded earlier)
+            self.page_slider.setVisible(False)
+            self.page_value.setVisible(False)
+
+            qpix = QPixmap(path)
+            if qpix.isNull():
+                raise ValueError("Failed to load image.")
+            self.cover_path = path
+            self.cover_qpix = qpix
+            self.cover_view.setImage(qpix)
+
+            im = Image.open(path)
+            self.img_info = {
+                "size": im.size,
+                "mode": im.mode,
+                "bands": len(im.getbands()),
+                "n_frames": 1,
+                "format": im.format or ext.upper().lstrip("."),
+            }
+            self.cover_info.setText(
+                f"Path: {path}\nFormat: {im.format}, Mode: {im.mode}, Size: {im.size[0]}x{im.size[1]}"
+            )
 
             # Reset ROI/capacity UI
             self.roi_img = None
@@ -1218,7 +1468,6 @@ class ImageEncodeTab(QWidget):
 
         except Exception as e:
             self.error(str(e))
-
 
     def set_roi_from_image(self, x0: int, y0: int, w: int, h: int):
         self.roi_img = (x0, y0, w, h)
@@ -1268,46 +1517,160 @@ class ImageEncodeTab(QWidget):
         if not key:
             self.error("Key is required."); return
 
+        source_dir = get_source_dir()
+
         try:
-            cover_pil = Image.open(self.cover_path)
             ext = Path(self.cover_path).suffix.lower()
+            lsb = self.current_lsb()
+            x0, y0, w, h = self.roi_img
 
-            # ---------- GIF branch (direct, no normalization) ----------
-            if ext == ".gif":
-                cover_pil.seek(0)
+            # ---------- PDF branch ----------
+            if ext == ".pdf":
+                if not self.pdf_path:
+                    self.error("Internal: PDF path missing."); return
+                if self.pdf_page_count <= 0:
+                    self.error("This PDF appears to have no pages."); return
 
-                # Directly read full-canvas buffers + global palette
-                frame_bufs, imgW, imgH, channels, durations, base_info, chosen_palette = _gif_read_full_buffers(cover_pil)
-                n_frames = len(frame_bufs)
-                self.log(f"[gif] frames={n_frames}, size={imgW}x{imgH}")
+                # Render selected page (RGB only; no alpha)
+                pil_base, (imgW, imgH) = render_pdf_page_to_pil(
+                    self.pdf_path, self.pdf_page_index, dpi=200
+                )
+                cover_conv, channels, mode = _ensure_8bit_mode(pil_base)  # expect RGB/3
 
-                # ROI & capacity
-                lsb = self.current_lsb()
-                x0, y0, w, h = self.roi_img
                 if w <= 0 or h <= 0 or x0 < 0 or y0 < 0 or x0+w > imgW or y0+h > imgH:
                     self.error("ROI is out of bounds."); return
 
-                # KDF & header
-                cover_id  = cover_fingerprint(self.cover_path)
-                salt16    = canonical_salt(lsb, self.roi_img, cover_id, "image")[:16]
+                cover_id  = cover_fingerprint(self.pdf_path)
+                salt16    = canonical_salt(lsb, self.roi_img, cover_id,
+                                        f"pdf:page={self.pdf_page_index+1}")[:16]
                 kd        = kdf_from_key(key, salt16)
                 K_perm, K_bit, K_crypto, K_check, nonce = (
                     kd["K_perm"], kd["K_bit"], kd["K_crypto"], kd["K_check"], kd["nonce"]
                 )
 
-                # Encrypt & assemble bitstream (header + cipher)
+                # Encrypt + header
+                ks = _hmac_keystream(K_crypto, nonce, len(payload))
+                cipher = _xor(payload, ks)
+                header = build_header(1, lsb, self.roi_img,
+                                    len(payload), cover_id, salt16, nonce, K_check)
+
+                # Bitstream
+                bitstream = []
+                for b in header + cipher:
+                    for k in range(8):
+                        bitstream.append((b >> (7-k)) & 1)
+
+                buf, rW, rH, ch = _img_bytes_and_geometry(cover_conv)
+                slots = w*h*channels
+                perm  = _make_perm(slots, K_perm)
+                rot   = K_bit[0] % lsb
+
+                n_bits = len(bitstream)
+                if n_bits > slots * lsb:
+                    self.error(f"Payload too large for ROI capacity.\n"
+                            f"Need {n_bits} bits, capacity {slots*lsb} bits.")
+                    return
+
+                # Embed
+                i_bit = 0
+                while i_bit < n_bits:
+                    slot_index = i_bit // lsb
+                    plane      = ((i_bit % lsb) + rot) % lsb
+                    if slot_index >= slots:
+                        self.error("Internal error: slot overflow during embed."); return
+                    s  = perm[slot_index]
+                    px = s // channels
+                    c  = s % channels
+                    rel_x = px % w
+                    rel_y = px // w
+                    xx = x0 + rel_x
+                    yy = y0 + rel_y
+                    idx = _pixel_byte_index(xx, yy, c, rW, ch)
+                    buf[idx] = _set_bit(buf[idx], plane, bitstream[i_bit])
+                    i_bit += 1
+
+                stego_pil = Image.frombytes(mode, (rW, rH), bytes(buf))  # RGB
+
+                out_pdf = source_dir / f"{Path(self.cover_path).stem}_stego.pdf"
+                save_pdf_with_replaced_page(self.pdf_path,
+                                            self.pdf_page_index,
+                                            stego_pil,
+                                            str(out_pdf))
+
+                # Post-save self-check (re-render the same page and verify STG1)
+                try:
+                    chk_img, (cW, cH) = render_pdf_page_to_pil(
+                        str(out_pdf), self.pdf_page_index, dpi=200
+                    )
+                    conv2, ch2, _ = _ensure_8bit_mode(chk_img)
+                    buf2, W2, H2, _ = _img_bytes_and_geometry(conv2)
+                    frame_bufs2 = [buf2]
+
+                    HEADER_BITS = 84 * 8
+                    header_bytes_reloaded = _read_bits_from_buffers(
+                        frame_bufs2, W2, H2, ch2, self.roi_img, lsb,
+                        K_perm, K_bit, HEADER_BITS, 0, palette=None
+                    )
+                    _ = parse_header(header_bytes_reloaded)
+                    self.log("[self-check] PDF header verified after save (CRC OK).")
+                except Exception as _e:
+                    try: out_pdf.unlink(missing_ok=True)
+                    except Exception: pass
+                    self.error(f"Saved PDF failed header self-check: {_e}\n"
+                            "Tip: ensure encode/decode use the same page + DPI.")
+                    return
+
+                # meta with original PDF + page
+                try:
+                    meta_path = source_dir / f"{out_pdf.stem}.meta"
+                    meta_content = f"{Path(self.cover_path).absolute()}\npage={self.pdf_page_index+1}"
+                    meta_path.write_text(meta_content, encoding="utf-8")
+                    self.log(f"Saved meta: {meta_path}")
+                except Exception as _e:
+                    self.log(f"[WARN] Could not write meta file: {_e}")
+
+                # Final Key
+                token = make_key_token("image", lsb, self.roi_img, salt16, K_check)
+                self.key_token_edit.setText(token)
+                rot_dbg = K_bit[0] % lsb
+                self.log(f"Final Key: {token}")
+                self.log(f"Header bytes={len(header)} salt16={salt16.hex()} "
+                        f"bit_rot={rot_dbg} order_seed={int.from_bytes(K_perm,'little')}")
+
+                QtWidgets.QMessageBox.information(
+                    self, "Encode complete",
+                    f"Embedded {len(payload)} bytes (encrypted) with a {len(header)}-byte header.\n"
+                    f"Saved: {out_pdf}\nFinal Key is shown above.\n"
+                    f"(PDF page {self.pdf_page_index+1} was modified.)"
+                )
+                return
+
+            # ---------- GIF branch ----------
+            if ext == ".gif":
+                cover_pil = Image.open(self.cover_path)
+                cover_pil.seek(0)
+                frame_bufs, imgW, imgH, channels, durations, base_info, chosen_palette = _gif_read_full_buffers(cover_pil)
+                n_frames = len(frame_bufs)
+                if w <= 0 or h <= 0 or x0 < 0 or y0 < 0 or x0+w > imgW or y0+h > imgH:
+                    self.error("ROI is out of bounds."); return
+
+                cover_id  = cover_fingerprint(self.cover_path)
+                salt16    = canonical_salt(lsb, self.roi_img, cover_id, "image")[:16]
+                kd        = kdf_from_key(key, salt16)
+                K_perm, K_bit, K_crypto, K_check, nonce = kd["K_perm"], kd["K_bit"], kd["K_crypto"], kd["K_check"], kd["nonce"]
+
                 ks = _hmac_keystream(K_crypto, nonce, len(payload))
                 cipher = _xor(payload, ks)
                 header = build_header(1, lsb, self.roi_img, len(payload), cover_id, salt16, nonce, K_check)
+
                 bitstream = []
                 for b in header + cipher:
                     for k in range(8):
                         bitstream.append((b >> (7 - k)) & 1)
 
-                # Embed bits
                 _embed_bits_gif(frame_bufs, imgW, imgH, self.roi_img, lsb, K_perm, K_bit, bitstream, chosen_palette)
 
-                # -------- PRE-SAVE SELF-CHECK --------
+                # Pre-save self-check
                 try:
                     HEADER_BYTES = 84
                     header_bytes_embed = _read_bits_from_buffers(
@@ -1315,7 +1678,7 @@ class ImageEncodeTab(QWidget):
                         HEADER_BYTES * 8, 0, palette=chosen_palette
                     )
                     _ = parse_header(header_bytes_embed)
-                    self.log("[self-check] In-memory header verified (CRC OK).")
+                    self.log("[self-check] In-memory GIF header verified (CRC OK).")
                 except Exception as _e:
                     msg = QtWidgets.QMessageBox(self)
                     msg.setIcon(QtWidgets.QMessageBox.Warning)
@@ -1331,18 +1694,15 @@ class ImageEncodeTab(QWidget):
 
                     current = self.current_lsb()
                     if msg.clickedButton() == btn_inc and current < 8:
-                        self.lsb_slider.setValue(current + 1)
-                        self.log(f"[Retry] Retrying encode with LSB={current+1}")
-                        self.on_encode(); return
+                        self.lsb_slider.setValue(current + 1); self.on_encode(); return
                     elif msg.clickedButton() == btn_dec and current > 1:
-                        self.lsb_slider.setValue(current - 1)
-                        self.log(f"[Retry] Retrying encode with LSB={current-1}")
-                        self.on_encode(); return
+                        self.lsb_slider.setValue(current - 1); self.on_encode(); return
                     else:
                         self.log(f"[self-check FAILED] Details: {_e}")
                         return
 
-                # Save stego GIF
+                # Save GIF in /source
+                out_path = source_dir / f"{Path(self.cover_path).stem}_stego.gif"
                 rebuilt = []
                 for i, buf in enumerate(frame_bufs):
                     fr = Image.new("P", (imgW, imgH))
@@ -1353,9 +1713,8 @@ class ImageEncodeTab(QWidget):
                     fr.info.pop("transparency", None)
                     rebuilt.append(fr)
 
-                out_path = str(Path(self.cover_path).with_suffix("")) + "_stego.gif"
                 rebuilt[0].save(
-                    out_path,
+                    str(out_path),
                     format="GIF",
                     save_all=True,
                     append_images=rebuilt[1:],
@@ -1366,7 +1725,7 @@ class ImageEncodeTab(QWidget):
                     subrectangles=False,
                 )
 
-                # -------- POST-SAVE SELF-CHECK --------
+                # Post-save self-check
                 try:
                     HEADER_BYTES = 84
                     with Image.open(out_path) as _chk:
@@ -1374,7 +1733,6 @@ class ImageEncodeTab(QWidget):
                         rb_frame_bufs, rbW, rbH, rb_channels, rb_durations, rb_info, _ = _gif_read_full_buffers(
                             _chk, forced_palette=chosen_palette
                         )
-
                     if rbW != imgW or rbH != imgH:
                         raise ValueError(f"Geometry changed: {imgW}x{imgH} -> {rbW}x{rbH}")
                     if len(rb_frame_bufs) != len(frame_bufs):
@@ -1386,7 +1744,6 @@ class ImageEncodeTab(QWidget):
                     )
                     _ = parse_header(header_bytes_reloaded)
                     self.log("[self-check] GIF header verified after save (CRC OK).")
-
                 except Exception as _e:
                     try: Path(out_path).unlink(missing_ok=True)
                     except Exception: pass
@@ -1401,35 +1758,29 @@ class ImageEncodeTab(QWidget):
                     btn_dec = msg.addButton("Decrease LSB (-1)", QtWidgets.QMessageBox.ActionRole)
                     btn_cancel = msg.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
                     msg.exec()
-
                     current = self.current_lsb()
                     if msg.clickedButton() == btn_inc and current < 8:
-                        self.lsb_slider.setValue(current + 1)
-                        self.log(f"[Retry] Retrying encode with LSB={current+1}")
-                        self.on_encode(); return
+                        self.lsb_slider.setValue(current + 1); self.on_encode(); return
                     elif msg.clickedButton() == btn_dec and current > 1:
-                        self.lsb_slider.setValue(current - 1)
-                        self.log(f"[Retry] Retrying encode with LSB={current-1}")
-                        self.on_encode(); return
+                        self.lsb_slider.setValue(current - 1); self.on_encode(); return
                     else:
                         self.log(f"[self-check FAILED] Details: {_e}")
                         return
 
-                # Success → show Final Key
-                token = make_key_token("image", lsb, self.roi_img, salt16, K_check)
-                self.key_token_edit.setText(token)
-                self.log(f"Final Key: {token}")
-
-                rot = K_bit[0] % lsb
-                self.log(f"Header bytes={len(header)} salt16={salt16.hex()} bit_rot={rot} "
-                        f"order_seed={int.from_bytes(K_perm,'little')}")
+                # meta + token
                 try:
-                    meta_path = Path(out_path).with_suffix(".meta")
+                    meta_path = source_dir / f"{out_path.stem}.meta"
                     meta_path.write_text(str(Path(self.cover_path).absolute()), encoding="utf-8")
                     self.log(f"Saved meta: {meta_path}")
                 except Exception as _e:
                     self.log(f"[WARN] Could not write meta file: {_e}")
 
+                token = make_key_token("image", lsb, self.roi_img, salt16, K_check)
+                self.key_token_edit.setText(token)
+                self.log(f"Final Key: {token}")
+                rot_dbg = K_bit[0] % lsb
+                self.log(f"Header bytes={len(header)} salt16={salt16.hex()} bit_rot={rot_dbg} "
+                        f"order_seed={int.from_bytes(K_perm,'little')}")
                 QtWidgets.QMessageBox.information(
                     self, "Encode complete",
                     f"Embedded {len(payload)} bytes (encrypted) with a {len(header)}-byte header.\n"
@@ -1437,13 +1788,9 @@ class ImageEncodeTab(QWidget):
                 )
                 return
 
-            # ---------- Non-GIF branch ----------
+            # ---------- Static (non-GIF) images ----------
+            cover_pil = Image.open(self.cover_path)
             cover_conv, channels, mode = _ensure_8bit_mode(cover_pil)
-            if cover_conv.size != cover_pil.size:
-                self.log("Cover converted to RGB for embedding.")
-
-            lsb = self.current_lsb()
-            x0, y0, w, h = self.roi_img
             W, H = cover_conv.size
             if w <= 0 or h <= 0 or x0 < 0 or y0 < 0 or x0+w > W or y0+h > H:
                 self.error("ROI is out of bounds."); return
@@ -1455,8 +1802,8 @@ class ImageEncodeTab(QWidget):
 
             ks = _hmac_keystream(K_crypto, nonce, len(payload))
             cipher = _xor(payload, ks)
-
             header = build_header(1, lsb, self.roi_img, len(payload), cover_id, salt16, nonce, K_check)
+
             bitstream = []
             for b in header + cipher:
                 for k in range(8):
@@ -1482,30 +1829,36 @@ class ImageEncodeTab(QWidget):
                 c  = s % channels
                 rel_x = px % w
                 rel_y = px // w
-                x = x0 + rel_x
-                y = y0 + rel_y
-                idx = _pixel_byte_index(x, y, c, imgW, ch)
+                xx = x0 + rel_x
+                yy = y0 + rel_y
+                idx = _pixel_byte_index(xx, yy, c, imgW, ch)
                 buf[idx] = _set_bit(buf[idx], plane, bitstream[i_bit])
                 i_bit += 1
 
-            out_path = str(Path(self.cover_path).with_suffix("")) + "_stego.png"
-            Image.frombytes(mode, (imgW, imgH), bytes(buf)).save(out_path, format="PNG")
+            out_path_local, pil_fmt, save_kwargs = choose_stego_path_and_params(self.cover_path)
+            out_path = source_dir / out_path_local.name
+
+            Image.frombytes(mode, (imgW, imgH), bytes(buf)).save(str(out_path), format=pil_fmt, **save_kwargs)
+
+            if Path(self.cover_path).suffix.lower() in {".jpg", ".jpeg"}:
+                self.log("Source was JPEG. Saved stego as PNG to avoid lossy corruption of hidden data.")
+            elif Path(self.cover_path).suffix.lower() == ".webp" and not save_kwargs.get("lossless", False):
+                self.log("[WARN] WEBP must be saved losslessly to preserve bits.")
 
             try:
-                meta_path = Path(out_path).with_suffix(".meta")
+                meta_path = source_dir / f"{out_path.stem}.meta"
                 meta_path.write_text(str(Path(self.cover_path).absolute()), encoding="utf-8")
                 self.log(f"Saved meta: {meta_path}")
             except Exception as _e:
                 self.log(f"[WARN] Could not write meta file: {_e}")
 
-            # Final Key AFTER successful save
             token = make_key_token("image", lsb, self.roi_img, salt16, K_check)
             self.key_token_edit.setText(token)
             self.log(f"Final Key: {token}")
             self.log(f"Header bytes={len(header)} salt16={salt16.hex()} bit_rot={rot} "
                     f"order_seed={int.from_bytes(K_perm,'little')}")
             if Path(self.cover_path).suffix.lower() in {".jpg", ".jpeg"}:
-                self.log("Note: Source was JPEG. Bits are saved losslessly to PNG as '..._stego.png'. Re-saving as JPEG will corrupt hidden data.")
+                self.log("Note: Re-saving the stego PNG as JPEG will corrupt hidden data.")
             QtWidgets.QMessageBox.information(
                 self, "Encode complete",
                 f"Embedded {len(payload)} bytes (encrypted) with a {len(header)}-byte header.\n"
@@ -1514,6 +1867,10 @@ class ImageEncodeTab(QWidget):
 
         except Exception as e:
             self.error(str(e))
+
+
+
+
     
     # --------- helpers for logging/errors ----------
     def log(self, msg: str):
@@ -1571,11 +1928,39 @@ class ImageDecodeTab(QWidget):
     def load_stego(self, path: str):
         try:
             ext = Path(path).suffix.lower()
-            if ext not in IMAGE_EXTS: raise ValueError("Unsupported image format.")
+
+            # Allow PDFs and images
+            if ext not in (IMAGE_EXTS | {".pdf"}):
+                raise ValueError("Unsupported image format.")
+
             self.stego_path = path
+
+            if ext == ".pdf":
+                # Use PyMuPDF to inspect PDFs (PIL can't open PDFs)
+                if fitz is None:
+                    raise RuntimeError("PyMuPDF (fitz) is required for PDF support. Install with: pip install pymupdf")
+                doc = fitz.open(path)
+                pages = len(doc)
+                doc.close()
+
+                # Store page state (optional; on_decode also reads .meta)
+                self.pdf_page_count = pages
+                self.pdf_page_index = 0  # default to first page
+
+                self.media_info.setText(
+                    f"Path: {path}\nFormat: PDF, Pages: {pages}\n"
+                    f"Note: decoding will rasterize the selected page."
+                )
+                self.log(f"Loaded stego PDF: {path} (pages: {pages})")
+                return
+
+            # Non-PDF branch: use PIL to read basic info
             im = Image.open(path)
-            self.media_info.setText(f"Path: {path}\nFormat: {im.format}, Mode: {im.mode}, Size: {im.size[0]}x{im.size[1]}")
+            self.media_info.setText(
+                f"Path: {path}\nFormat: {im.format}, Mode: {im.mode}, Size: {im.size[0]}x{im.size[1]}"
+            )
             self.log(f"Loaded stego image: {path}")
+
         except Exception as e:
             self.error(str(e))
 
@@ -1592,21 +1977,40 @@ class ImageDecodeTab(QWidget):
             if info["media_kind"] != "image":
                 self.error("Final Key is not for an image."); return
 
-            im  = Image.open(self.stego_path)
             ext = Path(self.stego_path).suffix.lower()
+            self.log(f"DEBUG inspect: path={self.stego_path} ext={ext} roi={info['roi']} lsb={info['lsb']}")
 
             # Prepare buffers/geometry
             chosen_palette = None
             if ext == ".gif":
+                im  = Image.open(self.stego_path)
                 im.seek(0)
                 frame_bufs, imgW, imgH, channels, durations, base_info, chosen_palette = _gif_read_full_buffers(im)
-                n_frames = len(frame_bufs)
                 W, H = imgW, imgH
+            elif ext == ".pdf":
+                # Pick page (prefer .meta)
+                page_idx = getattr(self, "pdf_page_index", 0)
+                try:
+                    meta = Path(self.stego_path).with_suffix(".meta")
+                    if meta.exists():
+                        for line in meta.read_text(encoding="utf-8").splitlines():
+                            if line.lower().startswith("page="):
+                                v = int(line.split("=",1)[1].strip())
+                                if v >= 1:
+                                    page_idx = v - 1
+                                break
+                except Exception:
+                    pass
+                pil_base, (imgW, imgH) = render_pdf_page_to_pil(self.stego_path, page_idx, dpi=200)
+                conv, channels, mode = _ensure_8bit_mode(pil_base)
+                buf, rW, rH, ch = _img_bytes_and_geometry(conv)
+                frame_bufs = [buf]; W, H = rW, rH
+                self.log(f"DEBUG inspect pdf_page={page_idx+1} dpi=200 W={W} H={H} channels={channels}")
             else:
+                im  = Image.open(self.stego_path)
                 conv, channels, mode = _ensure_8bit_mode(im)
                 buf, imgW, imgH, ch = _img_bytes_and_geometry(conv)
                 frame_bufs = [buf]
-                n_frames = 1
                 W, H = imgW, imgH
 
             x0, y0, w, h = info["roi"]
@@ -1623,9 +2027,10 @@ class ImageDecodeTab(QWidget):
             HEADER_BITS = 84 * 8
 
             header_bytes = _read_bits_from_buffers(
-                frame_bufs, imgW, imgH, channels, info["roi"], lsb, K_perm, K_bit,
-                HEADER_BITS, 0, palette=chosen_palette if channels == 1 else None
+                frame_bufs, W, H, channels, info["roi"], lsb, K_perm, K_bit,
+                HEADER_BITS, 0, palette=chosen_palette if (ext == ".gif" and channels == 1) else None
             )
+            self.log(f"DEBUG header[0:8]={header_bytes[:8].hex()} len={len(header_bytes)}")
             hdr = parse_header(header_bytes)
 
             if hdr["lsb"] != lsb or hdr["roi"] != tuple(info["roi"]):
@@ -1643,6 +2048,7 @@ class ImageDecodeTab(QWidget):
             self.error(str(e))
 
 
+
     def on_decode(self):
         if not self.stego_path:
             self.error("Load a stego image first."); return
@@ -1651,47 +2057,250 @@ class ImageDecodeTab(QWidget):
         if not token or not user_key:
             self.error("Provide both Final Key token and the user key."); return
 
+        source_dir = get_source_dir()
+
         try:
             info = parse_key_token(token)
             if info["media_kind"] != "image":
                 self.error("Final Key is not for an image."); return
 
-            im  = Image.open(self.stego_path)
             ext = Path(self.stego_path).suffix.lower()
 
-            # Prepare buffers / geometry
-            chosen_palette = None
+            # ---------- PDF branch ----------
+            if ext == ".pdf":
+                # 1) decide which page to try first
+                #    a) meta file page=... (1-based) wins
+                #    b) otherwise use UI (if present) 0-based
+                #    c) if still not found, scan all pages for STG1
+                first_page_idx = getattr(self, "pdf_page_index", 0)
+                try:
+                    meta = Path(self.stego_path).with_suffix(".meta")
+                    if meta.exists():
+                        for line in meta.read_text(encoding="utf-8").splitlines():
+                            if line.lower().startswith("page="):
+                                v = int(line.split("=",1)[1].strip())
+                                if v >= 1:
+                                    first_page_idx = v - 1
+                                break
+                except Exception:
+                    pass
+
+                # 2) KDF & key check once
+                kd = kdf_from_key(user_key, info["salt16"])
+                K_perm, K_bit, K_crypto, K_check, _nonce_from_kdf = (
+                    kd["K_perm"], kd["K_bit"], kd["K_crypto"], kd["K_check"], kd["nonce"]
+                )
+                if K_check != info["kcheck4"]:
+                    self.error("Wrong user key for this Final Key (K_check mismatch)."); return
+
+                lsb = info["lsb"]
+                HEADER_BITS = 84 * 8
+
+                def try_page(pidx: int):
+                    pil_base, (imgW, imgH) = render_pdf_page_to_pil(self.stego_path, pidx, dpi=200)
+                    conv, channels, _mode = _ensure_8bit_mode(pil_base)
+                    buf, rW, rH, ch = _img_bytes_and_geometry(conv)
+                    frame_bufs = [buf]
+                    x0, y0, w, h = info["roi"]
+                    if w <= 0 or h <= 0 or x0 < 0 or y0 < 0 or x0+w > rW or y0+h > rH:
+                        return None, None, None
+                    header_bytes = _read_bits_from_buffers(
+                        frame_bufs, rW, rH, channels, info["roi"], lsb, K_perm, K_bit,
+                        HEADER_BITS, 0, palette=None
+                    )
+                    return header_bytes, (rW, rH, channels), frame_bufs
+
+                def looks_like_header(b: bytes) -> bool:
+                    return len(b) >= 4 and b[:4] == b"STG1"
+
+                #self.log(f"DEBUG decode(pdf): trying page={first_page_idx+1}")
+                hb, dims, fbufs = try_page(first_page_idx)
+                good_page = None
+
+                if hb is None or not looks_like_header(hb):
+                    # scan all pages
+                    #self.log("DEBUG decode(pdf): first guess failed; scanning all pages for STG1…")
+                    try:
+                        import fitz
+                        doc = fitz.open(self.stego_path)
+                        total = len(doc)
+                        doc.close()
+                    except Exception as e:
+                        self.error(f"Cannot open PDF to count pages: {e}"); return
+
+                    for pidx in range(total):
+                        hb2, dims2, fbufs2 = try_page(pidx)
+                        if hb2 is None:
+                            continue
+                        if looks_like_header(hb2):
+                            good_page, hb, dims, fbufs = pidx, hb2, dims2, fbufs2
+                            #self.log(f"DEBUG decode(pdf): found STG1 on page {pidx+1}")
+                            break
+
+                    if good_page is None:
+                        self.error("Could not find a valid STG1 header on any page of this PDF.\n"
+                                "Ensure you’re opening the stego PDF and using the matching Final Key/ROI/LSB.")
+                        return
+                else:
+                    good_page = first_page_idx
+                    #self.log("DEBUG decode(pdf): STG1 found on first try.")
+
+                #self.log(f"DEBUG header[0:8]={hb[:8].hex()} len={len(hb)}")
+                try:
+                    hdr = parse_header(hb)
+                except Exception as e:
+                    self.error(f"Header parse failed on page {good_page+1}: {e}"); return
+
+                if hdr["lsb"] != lsb or hdr["roi"] != tuple(info["roi"]):
+                    self.error("Header mismatch (ROI/LSB do not match Final Key)."); return
+                if hdr["salt16"] != info["salt16"]:
+                    self.error("Header salt does not match Final Key salt."); return
+
+                rW, rH, channels = dims
+                x0, y0, w, h = info["roi"]
+                total_bits_needed = (84 + hdr["payload_len"]) * 8
+                slots_total = w * h * channels
+                if total_bits_needed > slots_total * lsb:
+                    self.error("Stego does not contain the declared payload length (capacity shortfall)."); return
+
+                cipher_bytes = _read_bits_from_buffers(
+                    fbufs, rW, rH, channels, info["roi"], lsb, K_perm, K_bit,
+                    hdr["payload_len"] * 8, HEADER_BITS, palette=None
+                )
+                ks = _hmac_keystream(K_crypto, hdr["nonce12"], len(cipher_bytes))
+                payload = _xor(cipher_bytes, ks)
+
+                out_base = Path(self.stego_path).stem
+                ext_guess, label, is_text = guess_image_or_text_ext(payload)
+                dest = source_dir / f"{out_base}_payload{ext_guess}"
+
+                if is_text and ext_guess == ".txt":
+                    txt = payload.decode("utf-8", errors="strict")
+                    with open(dest, "w", encoding="utf-8") as f:
+                        f.write(txt)
+                else:
+                    with open(dest, "wb") as f:
+                        f.write(payload)
+
+                self.log(f"Saved payload as {dest} ({label}, {human_bytes(len(payload))})")
+                QtWidgets.QMessageBox.information(
+                    self, "Decode complete",
+                    f"Recovered {len(payload)} bytes from PDF page {good_page+1}.\n"
+                    f"Detected: {label}\nSaved to:\n{dest}"
+                )
+                return
+
+            # ---------- GIF branch ----------
             if ext == ".gif":
+                im  = Image.open(self.stego_path)
                 im.seek(0)
                 frame_bufs, imgW, imgH, channels, durations, base_info, chosen_palette = _gif_read_full_buffers(im)
-                n_frames = len(frame_bufs)
                 W, H = imgW, imgH
-            else:
-                conv, channels, mode = _ensure_8bit_mode(im)
-                buf, imgW, imgH, ch = _img_bytes_and_geometry(conv)
-                frame_bufs = [buf]
-                n_frames = 1
-                W, H = imgW, imgH
+
+                x0, y0, w, h = info["roi"]
+                if w <= 0 or h <= 0 or x0 < 0 or y0 < 0 or x0+w > W or y0+h > H:
+                    self.error("Token ROI is out of bounds for this image."); return
+
+                kd = kdf_from_key(user_key, info["salt16"])
+                K_perm, K_bit, K_crypto, K_check, _nonce_from_kdf = kd["K_perm"], kd["K_bit"], kd["K_crypto"], kd["K_check"], kd["nonce"]
+                if K_check != info["kcheck4"]:
+                    self.error("Wrong user key for this Final Key (K_check mismatch)."); return
+
+                lsb = info["lsb"]
+                HEADER_BITS = 84 * 8
+
+                header_bytes = _read_bits_from_buffers(
+                    frame_bufs, imgW, imgH, channels, info["roi"], lsb, K_perm, K_bit,
+                    HEADER_BITS, 0, palette=chosen_palette if channels == 1 else None
+                )
+                hdr = parse_header(header_bytes)
+
+                if hdr["lsb"] != lsb or hdr["roi"] != tuple(info["roi"]):
+                    self.error("Header mismatch (ROI/LSB do not match Final Key)."); return
+                if hdr["salt16"] != info["salt16"]:
+                    self.error("Header salt does not match Final Key salt."); return
+
+                total_bits_needed = (84 + hdr["payload_len"]) * 8
+                slots_total = w * h * channels * (len(frame_bufs))
+                if total_bits_needed > slots_total * lsb:
+                    self.error("Stego does not contain the declared payload length (capacity shortfall)."); return
+
+                cipher_bytes = _read_bits_from_buffers(
+                    frame_bufs, imgW, imgH, channels, info["roi"], lsb, K_perm, K_bit,
+                    hdr["payload_len"] * 8, HEADER_BITS, palette=chosen_palette if channels == 1 else None
+                )
+
+                ks = _hmac_keystream(K_crypto, hdr["nonce12"], len(cipher_bytes))
+                payload = _xor(cipher_bytes, ks)
+
+                out_base = Path(self.stego_path).stem
+                ext_guess, label, is_text = guess_image_or_text_ext(payload)
+                dest = source_dir / f"{out_base}_payload{ext_guess}"
+
+                if is_text and ext_guess == ".txt":
+                    txt = payload.decode("utf-8", errors="strict")
+                    with open(dest, "w", encoding="utf-8") as f:
+                        f.write(txt)
+                else:
+                    with open(dest, "wb") as f:
+                        f.write(payload)
+
+                self.log(f"Saved payload as {dest} ({label}, {human_bytes(len(payload))})")
+                QtWidgets.QMessageBox.information(
+                    self, "Decode complete",
+                    f"Recovered {len(payload)} bytes.\nDetected: {label}\nSaved to:\n{dest}"
+                )
+
+                # Optional preview dialog (unchanged)
+                cover_guess = None
+                try:
+                    meta = Path(self.stego_path).with_suffix(".meta")
+                    if meta.exists():
+                        candidate = meta.read_text(encoding="utf-8").strip()
+                        if candidate and Path(candidate).exists():
+                            try:
+                                if cover_fingerprint(candidate) == hdr["cover_fp16"]:
+                                    cover_guess = candidate
+                                    self.log(f"Auto-loaded cover from meta: {cover_guess}")
+                                else:
+                                    self.log("[WARN] Meta cover fingerprint mismatch; not auto-loading.")
+                            except Exception as _ve:
+                                self.log(f"[WARN] Could not verify meta cover fingerprint: {_ve}")
+                except Exception as _e:
+                    self.log(f"[WARN] Auto-cover lookup failed: {_e}")
+
+                dlg = DecodePreviewDialog(
+                    stego_path=self.stego_path,
+                    payload_path=str(dest),
+                    payload_label=label,
+                    is_text=is_text,
+                    cover_path=cover_guess
+                )
+                dlg.exec()
+                return
+
+            # ---------- Non-GIF images ----------
+            im  = Image.open(self.stego_path)
+            conv, channels, mode = _ensure_8bit_mode(im)
+            buf, imgW, imgH, ch = _img_bytes_and_geometry(conv)
+            frame_bufs = [buf]
+            W, H = imgW, imgH
 
             x0, y0, w, h = info["roi"]
             if w <= 0 or h <= 0 or x0 < 0 or y0 < 0 or x0+w > W or y0+h > H:
                 self.error("Token ROI is out of bounds for this image."); return
 
-            # KDF & key check
             kd = kdf_from_key(user_key, info["salt16"])
-            K_perm, K_bit, K_crypto, K_check, _nonce_from_kdf = (
-                kd["K_perm"], kd["K_bit"], kd["K_crypto"], kd["K_check"], kd["nonce"]
-            )
+            K_perm, K_bit, K_crypto, K_check, _nonce_from_kdf = kd["K_perm"], kd["K_bit"], kd["K_crypto"], kd["K_check"], kd["nonce"]
             if K_check != info["kcheck4"]:
                 self.error("Wrong user key for this Final Key (K_check mismatch)."); return
 
             lsb = info["lsb"]
             HEADER_BITS = 84 * 8
 
-            # Read header then payload
             header_bytes = _read_bits_from_buffers(
                 frame_bufs, imgW, imgH, channels, info["roi"], lsb, K_perm, K_bit,
-                HEADER_BITS, 0, palette=chosen_palette if channels == 1 else None
+                HEADER_BITS, 0, palette=None
             )
             hdr = parse_header(header_bytes)
 
@@ -1701,22 +2310,21 @@ class ImageDecodeTab(QWidget):
                 self.error("Header salt does not match Final Key salt."); return
 
             total_bits_needed = (84 + hdr["payload_len"]) * 8
-            slots_total = w * h * channels * (len(frame_bufs))
+            slots_total = w * h * channels
             if total_bits_needed > slots_total * lsb:
                 self.error("Stego does not contain the declared payload length (capacity shortfall)."); return
 
             cipher_bytes = _read_bits_from_buffers(
                 frame_bufs, imgW, imgH, channels, info["roi"], lsb, K_perm, K_bit,
-                hdr["payload_len"] * 8, HEADER_BITS, palette=chosen_palette if channels == 1 else None
+                hdr["payload_len"] * 8, HEADER_BITS, palette=None
             )
 
             ks = _hmac_keystream(K_crypto, hdr["nonce12"], len(cipher_bytes))
             payload = _xor(cipher_bytes, ks)
 
-            out_dir  = Path(self.stego_path).parent
             out_base = Path(self.stego_path).stem
             ext_guess, label, is_text = guess_image_or_text_ext(payload)
-            dest = out_dir / f"{out_base}_payload{ext_guess}"
+            dest = source_dir / f"{out_base}_payload{ext_guess}"
 
             if is_text and ext_guess == ".txt":
                 txt = payload.decode("utf-8", errors="strict")
@@ -1732,7 +2340,7 @@ class ImageDecodeTab(QWidget):
                 f"Recovered {len(payload)} bytes.\nDetected: {label}\nSaved to:\n{dest}"
             )
 
-            # Optional: auto-load original cover (unchanged)
+            # Optional preview dialog (unchanged)
             cover_guess = None
             try:
                 meta = Path(self.stego_path).with_suffix(".meta")
@@ -1747,20 +2355,6 @@ class ImageDecodeTab(QWidget):
                                 self.log("[WARN] Meta cover fingerprint mismatch; not auto-loading.")
                         except Exception as _ve:
                             self.log(f"[WARN] Could not verify meta cover fingerprint: {_ve}")
-                else:
-                    stem = Path(self.stego_path).stem
-                    if stem.endswith("_stego"):
-                        base = stem[:-6]
-                        for ext_guess2 in [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff"]:
-                            guess = Path(self.stego_path).with_name(base + ext_guess2)
-                            if guess.exists():
-                                try:
-                                    if cover_fingerprint(guess) == hdr["cover_fp16"]:
-                                        cover_guess = str(guess)
-                                        self.log(f"Guessed and verified cover: {cover_guess}")
-                                        break
-                                except Exception:
-                                    pass
             except Exception as _e:
                 self.log(f"[WARN] Auto-cover lookup failed: {_e}")
 
@@ -1775,6 +2369,7 @@ class ImageDecodeTab(QWidget):
 
         except Exception as e:
             self.error(str(e))
+
 
 
 
