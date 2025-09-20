@@ -123,6 +123,148 @@ def parse_key_token(token: str) -> dict:
     return {"media_kind": media_kind, "lsb": lsb, "roi": (x0,y0,w,h), "salt16": salt16, "kcheck4": kcheck4}
 
 # ---------- Stego helpers ----------
+def _embed_bits_gif(frame_bufs, imgW, imgH, roi, lsb, K_perm, K_bit,
+                    bitstream: list[int], palette: list[int]) -> None:
+    """
+    In-place embed for GIF buffers with base-anchored palette-collision safety.
+    Raises if effective capacity is insufficient.
+    """
+    x0, y0, w, h = roi
+    n_frames = len(frame_bufs)
+    channels = 1
+    slots_per_frame = w * h * channels
+    slots_total     = slots_per_frame * n_frames
+
+    perm = _make_perm(slots_total, K_perm)
+    rot  = K_bit[0] % lsb
+    safe_mask = _palette_safe_mask(palette, lsb)
+
+    bits_needed = len(bitstream)
+    bits_written = 0
+    slot_i = 0
+
+    while bits_written < bits_needed:
+        if slot_i >= slots_total:
+            raise ValueError("Effective capacity too small after palette-collision safety.")
+        s = perm[slot_i]
+        fidx = s // slots_per_frame
+        rem  = s %  slots_per_frame
+
+        px = rem
+        rel_x = px % w
+        rel_y = px // w
+        x = x0 + rel_x
+        y = y0 + rel_y
+        idx = (y * imgW + x)
+
+        cur = frame_bufs[fidx][idx]
+        for off in range(lsb):
+            plane = (off + rot) % lsb
+            if ((safe_mask[cur] >> plane) & 1) == 0:
+                continue
+            frame_bufs[fidx][idx] = _set_bit(frame_bufs[fidx][idx], plane, bitstream[bits_written])
+            # We purposely do NOT re-evaluate safety against the mutated index; mask is base-anchored.
+            bits_written += 1
+            if bits_written >= bits_needed:
+                break
+        slot_i += 1
+
+
+
+def _palette_safe_mask(palette: list[int], lsb: int) -> list[int]:
+    """
+    Base-anchored safety mask.
+    For each palette index i, we define base = i with the lowest `lsb` bits zeroed.
+    A plane p (0..lsb-1) is usable iff palette[base] != palette[base ^ (1<<p)].
+    This makes the 'usable planes' decision independent of the current lower-bit values,
+    so writer and reader agree deterministically.
+    """
+    if not palette or len(palette) < 768:
+        raise ValueError("Palette missing/invalid (need 256*3 entries).")
+    colors = [(palette[i], palette[i+1], palette[i+2]) for i in range(0, 768, 3)]
+    safe = [0] * 256
+    lsb = max(1, min(lsb, 8))
+    low_mask = (1 << lsb) - 1
+    for i in range(256):
+        base = i & ~low_mask
+        m = 0
+        for p in range(lsb):
+            j = base ^ (1 << p)
+            if colors[base] != colors[j]:
+                m |= (1 << p)
+        safe[i] = m
+    return safe
+
+
+def _read_bits_from_buffers(frame_bufs, imgW, imgH, channels, roi, lsb, K_perm, K_bit,
+                            n_bits: int, start_bit: int = 0,
+                            palette: list[int] | None = None) -> bytes:
+    """
+    Read n_bits from buffers starting at start_bit. If `palette` is provided (GIF),
+    only planes deemed usable by the *base-anchored* palette mask are counted.
+    """
+    x0, y0, w, h = roi
+    n_frames = len(frame_bufs)
+    slots_per_frame = w * h * channels
+    slots_total = slots_per_frame * n_frames
+    perm = _make_perm(slots_total, K_perm)
+    rot = K_bit[0] % lsb
+    safe_mask = _palette_safe_mask(palette, lsb) if (palette is not None and channels == 1) else None
+
+    out_bits = []
+    logical_used = 0
+    slot_i = 0
+    while len(out_bits) < n_bits:
+        if slot_i >= slots_total:
+            raise ValueError("Ran out of slots while reading (capacity shortfall / mismatch).")
+        s = perm[slot_i]
+        fidx = s // slots_per_frame
+        rem  = s %  slots_per_frame
+
+        if channels == 1:
+            px = rem
+            rel_x = px % w
+            rel_y = px // w
+            x = x0 + rel_x
+            y = y0 + rel_y
+            idx = (y * imgW + x)
+            cur = frame_bufs[fidx][idx]
+        else:
+            px = rem // channels
+            c  = rem %  channels
+            rel_x = px % w
+            rel_y = px // w
+            x = x0 + rel_x
+            y = y0 + rel_y
+            idx = _pixel_byte_index(x, y, c, imgW, channels)
+            cur = frame_bufs[fidx][idx]
+
+        for off in range(lsb):
+            plane = (off + rot) % lsb
+            usable = True
+            if safe_mask is not None:
+                usable = ((safe_mask[cur] >> plane) & 1) == 1
+            if not usable:
+                continue
+            if logical_used < start_bit:
+                logical_used += 1
+                continue
+            bit = _get_bit(frame_bufs[fidx][idx], plane)
+            out_bits.append(bit)
+            logical_used += 1
+            if len(out_bits) >= n_bits:
+                break
+        slot_i += 1
+
+    out = bytearray()
+    for i in range(0, len(out_bits), 8):
+        byte = 0
+        for k in range(8):
+            byte = (byte << 1) | out_bits[i + k]
+        out.append(byte)
+    return bytes(out)
+
+
 def _gif_fullpal_buffers(gif: Image.Image):
     """
     Prepare GIF for embedding:
@@ -176,36 +318,67 @@ def _gif_fullpal_buffers(gif: Image.Image):
 
     return frame_bufs, W, H, 1, global_palette, durations, base_info
 
-def _gif_read_full_buffers(gif: Image.Image):
+def _gif_read_full_buffers(gif: Image.Image, forced_palette: list[int] | None = None):
     """
-    Read a stego GIF into FULL-CANVAS palette-index buffers.
-    Prefer 'P' frames; if Pillow yields RGB/RGBA, map each pixel back to the
-    exact global-palette index (no quantize). This preserves embedded LSBs
-    unless the file was saved with a different palette or with sub-rectangles.
+    Read a GIF into FULL-CANVAS palette-index buffers (W*H per frame), mapping all
+    frames to a single palette. If forced_palette is provided, we map into it.
+    Returns:
+      frame_bufs, W, H, channels(=1), durations, base_info, chosen_palette
     """
     from PIL import ImageSequence
 
     gif.seek(0)
     W, H = gif.size
-    frame_bufs = []
     durations = []
 
-    # Global palette → color->index map (preserve first occurrence for stability)
-    pal = gif.getpalette()
-    if not pal or len(pal) < 768:
-        raise ValueError("GIF missing/invalid global palette; cannot read indices deterministically.")
-    palette_colors = [(pal[i], pal[i+1], pal[i+2]) for i in range(0, 768, 3)]
+    def _ensure_palette_768(pal):
+        return pal if (pal and len(pal) >= 768) else None
+
+    chosen_palette = None
+    if forced_palette is not None:
+        chosen_palette = _ensure_palette_768(forced_palette)
+    if chosen_palette is None:
+        pal = _ensure_palette_768(gif.getpalette())
+        if pal is not None:
+            chosen_palette = pal
+
+    first_frame = None
+    if chosen_palette is None:
+        try:
+            first_frame = next(ImageSequence.Iterator(gif))
+            pal = _ensure_palette_768(first_frame.getpalette())
+            if pal is not None:
+                chosen_palette = pal
+        except StopIteration:
+            pass
+
+    if chosen_palette is None:
+        if first_frame is None:
+            gif.seek(0)
+            try:
+                first_frame = next(ImageSequence.Iterator(gif))
+            except StopIteration:
+                raise ValueError("GIF has no frames.")
+        base = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        base = Image.alpha_composite(base, first_frame.convert("RGBA"))
+        q = base.convert("RGB").quantize(colors=256, method=Image.MEDIANCUT, dither=Image.Dither.NONE)
+        chosen_palette = q.getpalette()
+        if not chosen_palette or len(chosen_palette) < 768:
+            raise ValueError("Could not synthesize a valid 256-color palette for GIF.")
+
+    gif.seek(0)
+
+    palette_colors = [(chosen_palette[i], chosen_palette[i+1], chosen_palette[i+2]) for i in range(0, 768, 3)]
     color_to_index = {}
     for idx, rgb in enumerate(palette_colors):
         if rgb not in color_to_index:
             color_to_index[rgb] = idx
 
     def map_rgb_to_indices(img_rgb: Image.Image) -> bytearray:
-        b = img_rgb.tobytes()  # W*H*3
+        b = img_rgb.tobytes()
         out = bytearray(W * H)
         mv = memoryview(b)
         pos = 0
-        # cache per-frame unique colors to indices
         local = {}
         for i in range(W * H):
             r = mv[pos]; g = mv[pos+1]; b_ = mv[pos+2]; pos += 3
@@ -214,11 +387,9 @@ def _gif_read_full_buffers(gif: Image.Image):
             if idx is None:
                 idx = color_to_index.get(key)
                 if idx is None:
-                    # Fallback (shouldn't happen if saved with the same global palette):
-                    best_i, best_d = 0, 1_000_000
+                    best_i, best_d = 0, 10**9
                     for j, (pr, pg, pb) in enumerate(palette_colors):
-                        dr = pr - r; dg = pg - g; db = pb - b_
-                        d = dr*dr + dg*dg + db*db
+                        d = (pr - r)*(pr - r) + (pg - g)*(pg - g) + (pb - b_)*(pb - b_)
                         if d < best_d:
                             best_i, best_d = j, d
                     idx = best_i
@@ -226,14 +397,11 @@ def _gif_read_full_buffers(gif: Image.Image):
             out[i] = idx & 0xFF
         return out
 
+    frame_bufs = []
     for frame in ImageSequence.Iterator(gif):
         if frame.size != (W, H):
-            raise ValueError("Stego GIF frame is not full-canvas; expected subrectangles=False.")
-        if frame.mode == "P":
-            buf = bytearray(frame.tobytes())
-        else:
-            # Map back to indices using the global palette (no quantize)
-            buf = map_rgb_to_indices(frame.convert("RGB"))
+            raise ValueError("Frame is not full-canvas; expected normalized GIF with subrectangles=False.")
+        buf = map_rgb_to_indices(frame.convert("RGB"))
         frame_bufs.append(buf)
         durations.append(frame.info.get("duration", gif.info.get("duration", 100)))
 
@@ -242,7 +410,8 @@ def _gif_read_full_buffers(gif: Image.Image):
     base_info["disposal"] = 2
     base_info.pop("transparency", None)
 
-    return frame_bufs, W, H, 1, durations, base_info
+    return frame_bufs, W, H, 1, durations, base_info, chosen_palette
+
 
 def _ensure_8bit_mode(pil_img: Image.Image) -> tuple[Image.Image, int, str]:
     """
@@ -1103,104 +1272,157 @@ class ImageEncodeTab(QWidget):
             cover_pil = Image.open(self.cover_path)
             ext = Path(self.cover_path).suffix.lower()
 
-            # ---------- GIF branch (animated, keep as GIF) ----------
+            # ---------- GIF branch (direct, no normalization) ----------
             if ext == ".gif":
                 cover_pil.seek(0)
 
-                # Full-canvas, single global palette indices
-                frame_bufs, imgW, imgH, channels, palette, durations, base_info = _gif_fullpal_buffers(cover_pil)
+                # Directly read full-canvas buffers + global palette
+                frame_bufs, imgW, imgH, channels, durations, base_info, chosen_palette = _gif_read_full_buffers(cover_pil)
                 n_frames = len(frame_bufs)
+                self.log(f"[gif] frames={n_frames}, size={imgW}x{imgH}")
 
                 # ROI & capacity
                 lsb = self.current_lsb()
                 x0, y0, w, h = self.roi_img
-                W, H = imgW, imgH
-                if w <= 0 or h <= 0 or x0 < 0 or y0 < 0 or x0+w > W or y0+h > H:
+                if w <= 0 or h <= 0 or x0 < 0 or y0 < 0 or x0+w > imgW or y0+h > imgH:
                     self.error("ROI is out of bounds."); return
-                capacity_bits = w * h * channels * lsb * n_frames  # channels=1
 
                 # KDF & header
-                cover_id = cover_fingerprint(self.cover_path)
-                full_salt = canonical_salt(lsb, self.roi_img, cover_id, "image")
-                salt16 = full_salt[:16]
-                kd = kdf_from_key(key, salt16)
+                cover_id  = cover_fingerprint(self.cover_path)
+                salt16    = canonical_salt(lsb, self.roi_img, cover_id, "image")[:16]
+                kd        = kdf_from_key(key, salt16)
                 K_perm, K_bit, K_crypto, K_check, nonce = (
                     kd["K_perm"], kd["K_bit"], kd["K_crypto"], kd["K_check"], kd["nonce"]
                 )
 
-                # Encrypt payload
+                # Encrypt & assemble bitstream (header + cipher)
                 ks = _hmac_keystream(K_crypto, nonce, len(payload))
                 cipher = _xor(payload, ks)
-
                 header = build_header(1, lsb, self.roi_img, len(payload), cover_id, salt16, nonce, K_check)
-
-                # Bitstream
                 bitstream = []
                 for b in header + cipher:
                     for k in range(8):
                         bitstream.append((b >> (7 - k)) & 1)
 
-                n_bits = len(bitstream)
-                if n_bits > capacity_bits:
-                    self.error(f"Payload too large for ROI capacity.\nNeed {n_bits} bits, capacity {capacity_bits} bits."); return
+                # Embed bits
+                _embed_bits_gif(frame_bufs, imgW, imgH, self.roi_img, lsb, K_perm, K_bit, bitstream, chosen_palette)
 
-                # Slot model across ALL frames
-                slots_per_frame = w * h * channels
-                slots_total = slots_per_frame * n_frames
-                perm = _make_perm(slots_total, K_perm)
-                rot = K_bit[0] % lsb
+                # -------- PRE-SAVE SELF-CHECK --------
+                try:
+                    HEADER_BYTES = 84
+                    header_bytes_embed = _read_bits_from_buffers(
+                        frame_bufs, imgW, imgH, 1, self.roi_img, lsb, K_perm, K_bit,
+                        HEADER_BYTES * 8, 0, palette=chosen_palette
+                    )
+                    _ = parse_header(header_bytes_embed)
+                    self.log("[self-check] In-memory header verified (CRC OK).")
+                except Exception as _e:
+                    msg = QtWidgets.QMessageBox(self)
+                    msg.setIcon(QtWidgets.QMessageBox.Warning)
+                    msg.setWindowTitle("Header CRC mismatch")
+                    msg.setText(
+                        "GIF failed header self-check (in-memory).\n"
+                        f"Details: {_e}\n\nRetry with a different LSB?"
+                    )
+                    btn_inc = msg.addButton("Increase LSB (+1)", QtWidgets.QMessageBox.ActionRole)
+                    btn_dec = msg.addButton("Decrease LSB (-1)", QtWidgets.QMessageBox.ActionRole)
+                    btn_cancel = msg.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+                    msg.exec()
 
-                # Embed
-                for i_bit, bit in enumerate(bitstream):
-                    slot_index = i_bit // lsb
-                    plane = ((i_bit % lsb) + rot) % lsb
+                    current = self.current_lsb()
+                    if msg.clickedButton() == btn_inc and current < 8:
+                        self.lsb_slider.setValue(current + 1)
+                        self.log(f"[Retry] Retrying encode with LSB={current+1}")
+                        self.on_encode(); return
+                    elif msg.clickedButton() == btn_dec and current > 1:
+                        self.lsb_slider.setValue(current - 1)
+                        self.log(f"[Retry] Retrying encode with LSB={current-1}")
+                        self.on_encode(); return
+                    else:
+                        self.log(f"[self-check FAILED] Details: {_e}")
+                        return
 
-                    s = perm[slot_index]
-                    fidx = s // slots_per_frame
-                    rem  = s %  slots_per_frame
-
-                    px = rem  # channels=1
-                    rel_x = px % w
-                    rel_y = px // w
-                    x = x0 + rel_x
-                    y = y0 + rel_y
-                    idx = (y * imgW + x)
-
-                    frame_bufs[fidx][idx] = _set_bit(frame_bufs[fidx][idx], plane, bit)
-
-                # Rebuild P-mode frames and save animated GIF (full-canvas, no optimization)
+                # Save stego GIF
                 rebuilt = []
                 for i, buf in enumerate(frame_bufs):
                     fr = Image.new("P", (imgW, imgH))
-                    fr.putpalette(palette)
-                    fr.putdata(buf)                     # exact indices
+                    fr.putpalette(chosen_palette)
+                    fr.putdata(buf)
                     fr.info["duration"] = durations[i] if i < len(durations) else (durations[-1] if durations else 100)
                     fr.info["disposal"] = 2
-                    # Make sure there is NO transparency carried (composited frames are opaque)
                     fr.info.pop("transparency", None)
                     rebuilt.append(fr)
 
                 out_path = str(Path(self.cover_path).with_suffix("")) + "_stego.gif"
-
-                # Critical save options:
-                #  - optimize=False         → do not re-map indices
-                #  - subrectangles=False    → force full-canvas frames
-                #  - no 'transparency'      → prevents RGBA expansion on load
-                #  - disposal=2             → restore to background
-                save_kwargs = dict(
+                rebuilt[0].save(
+                    out_path,
+                    format="GIF",
                     save_all=True,
                     append_images=rebuilt[1:],
                     loop=base_info.get("loop", 0),
                     duration=durations,
                     optimize=False,
                     disposal=2,
-                    subrectangles=False,    # <--- IMPORTANT
+                    subrectangles=False,
                 )
-                # DO NOT set transparency — it makes Pillow composite to RGBA on read
-                # save_kwargs["transparency"] = base_info.get("transparency")  # (intentionally omitted)
 
-                rebuilt[0].save(out_path, format="GIF", **save_kwargs)
-                # sidecar meta
+                # -------- POST-SAVE SELF-CHECK --------
+                try:
+                    HEADER_BYTES = 84
+                    with Image.open(out_path) as _chk:
+                        _chk.seek(0)
+                        rb_frame_bufs, rbW, rbH, rb_channels, rb_durations, rb_info, _ = _gif_read_full_buffers(
+                            _chk, forced_palette=chosen_palette
+                        )
+
+                    if rbW != imgW or rbH != imgH:
+                        raise ValueError(f"Geometry changed: {imgW}x{imgH} -> {rbW}x{rbH}")
+                    if len(rb_frame_bufs) != len(frame_bufs):
+                        raise ValueError(f"Frame count changed: {len(frame_bufs)} -> {len(rb_frame_bufs)}")
+
+                    header_bytes_reloaded = _read_bits_from_buffers(
+                        rb_frame_bufs, rbW, rbH, 1, self.roi_img, lsb, K_perm, K_bit,
+                        HEADER_BYTES * 8, 0, palette=chosen_palette
+                    )
+                    _ = parse_header(header_bytes_reloaded)
+                    self.log("[self-check] GIF header verified after save (CRC OK).")
+
+                except Exception as _e:
+                    try: Path(out_path).unlink(missing_ok=True)
+                    except Exception: pass
+                    msg = QtWidgets.QMessageBox(self)
+                    msg.setIcon(QtWidgets.QMessageBox.Warning)
+                    msg.setWindowTitle("Header CRC mismatch")
+                    msg.setText(
+                        "Saved GIF failed header self-check.\n"
+                        f"Details: {_e}\n\nRetry with a different LSB?"
+                    )
+                    btn_inc = msg.addButton("Increase LSB (+1)", QtWidgets.QMessageBox.ActionRole)
+                    btn_dec = msg.addButton("Decrease LSB (-1)", QtWidgets.QMessageBox.ActionRole)
+                    btn_cancel = msg.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+                    msg.exec()
+
+                    current = self.current_lsb()
+                    if msg.clickedButton() == btn_inc and current < 8:
+                        self.lsb_slider.setValue(current + 1)
+                        self.log(f"[Retry] Retrying encode with LSB={current+1}")
+                        self.on_encode(); return
+                    elif msg.clickedButton() == btn_dec and current > 1:
+                        self.lsb_slider.setValue(current - 1)
+                        self.log(f"[Retry] Retrying encode with LSB={current-1}")
+                        self.on_encode(); return
+                    else:
+                        self.log(f"[self-check FAILED] Details: {_e}")
+                        return
+
+                # Success → show Final Key
+                token = make_key_token("image", lsb, self.roi_img, salt16, K_check)
+                self.key_token_edit.setText(token)
+                self.log(f"Final Key: {token}")
+
+                rot = K_bit[0] % lsb
+                self.log(f"Header bytes={len(header)} salt16={salt16.hex()} bit_rot={rot} "
+                        f"order_seed={int.from_bytes(K_perm,'little')}")
                 try:
                     meta_path = Path(out_path).with_suffix(".meta")
                     meta_path.write_text(str(Path(self.cover_path).absolute()), encoding="utf-8")
@@ -1208,18 +1430,14 @@ class ImageEncodeTab(QWidget):
                 except Exception as _e:
                     self.log(f"[WARN] Could not write meta file: {_e}")
 
-                token = make_key_token("image", lsb, self.roi_img, salt16, K_check)
-                self.key_token_edit.setText(token)
-                self.log(f"Derived token: {token}")
-                self.log(f"Header bytes={len(header)} salt16={salt16.hex()} bit_rot={rot} order_seed={int.from_bytes(K_perm,'little')}")
-                QMessageBox.information(
+                QtWidgets.QMessageBox.information(
                     self, "Encode complete",
                     f"Embedded {len(payload)} bytes (encrypted) with a {len(header)}-byte header.\n"
-                    f"Saved: {out_path}\nCopy the Final Key for decoding."
+                    f"Saved: {out_path}\nFinal Key is shown above."
                 )
                 return
 
-            # ---------- non-GIF branch (static) ----------
+            # ---------- Non-GIF branch ----------
             cover_conv, channels, mode = _ensure_8bit_mode(cover_pil)
             if cover_conv.size != cover_pil.size:
                 self.log("Cover converted to RGB for embedding.")
@@ -1229,22 +1447,16 @@ class ImageEncodeTab(QWidget):
             W, H = cover_conv.size
             if w <= 0 or h <= 0 or x0 < 0 or y0 < 0 or x0+w > W or y0+h > H:
                 self.error("ROI is out of bounds."); return
-            capacity_bits = w*h*channels*lsb
 
-            cover_id = cover_fingerprint(self.cover_path)
-            full_salt = canonical_salt(lsb, self.roi_img, cover_id, "image")
-            salt16 = full_salt[:16]
-            kd = kdf_from_key(key, salt16)
+            cover_id  = cover_fingerprint(self.cover_path)
+            salt16    = canonical_salt(lsb, self.roi_img, cover_id, "image")[:16]
+            kd        = kdf_from_key(key, salt16)
             K_perm, K_bit, K_crypto, K_check, nonce = kd["K_perm"], kd["K_bit"], kd["K_crypto"], kd["K_check"], kd["nonce"]
 
             ks = _hmac_keystream(K_crypto, nonce, len(payload))
             cipher = _xor(payload, ks)
 
             header = build_header(1, lsb, self.roi_img, len(payload), cover_id, salt16, nonce, K_check)
-            total_bits = (len(header) + len(cipher)) * 8
-            if total_bits > capacity_bits:
-                self.error(f"Payload too large for ROI capacity.\nNeed {total_bits} bits, capacity {capacity_bits} bits."); return
-
             bitstream = []
             for b in header + cipher:
                 for k in range(8):
@@ -1252,16 +1464,20 @@ class ImageEncodeTab(QWidget):
 
             buf, imgW, imgH, ch = _img_bytes_and_geometry(cover_conv)
             slots = w*h*channels
-            perm = _make_perm(slots, K_perm)
-            rot = K_bit[0] % lsb
+            perm  = _make_perm(slots, K_perm)
+            rot   = K_bit[0] % lsb
 
-            i_bit = 0; n_bits = len(bitstream)
+            n_bits = len(bitstream)
+            if n_bits > slots * lsb:
+                self.error(f"Payload too large for ROI capacity.\nNeed {n_bits} bits, capacity {slots*lsb} bits."); return
+
+            i_bit = 0
             while i_bit < n_bits:
                 slot_index = i_bit // lsb
-                plane = ((i_bit % lsb) + rot) % lsb
+                plane      = ((i_bit % lsb) + rot) % lsb
                 if slot_index >= slots:
                     self.error("Internal error: slot overflow during embed."); return
-                s = perm[slot_index]
+                s  = perm[slot_index]
                 px = s // channels
                 c  = s % channels
                 rel_x = px % w
@@ -1282,20 +1498,24 @@ class ImageEncodeTab(QWidget):
             except Exception as _e:
                 self.log(f"[WARN] Could not write meta file: {_e}")
 
+            # Final Key AFTER successful save
             token = make_key_token("image", lsb, self.roi_img, salt16, K_check)
             self.key_token_edit.setText(token)
-
-            self.log(f"Derived token: {token}")
-            self.log(f"Header bytes={len(header)} salt16={salt16.hex()} bit_rot={rot} order_seed={int.from_bytes(K_perm,'little')}")
+            self.log(f"Final Key: {token}")
+            self.log(f"Header bytes={len(header)} salt16={salt16.hex()} bit_rot={rot} "
+                    f"order_seed={int.from_bytes(K_perm,'little')}")
             if Path(self.cover_path).suffix.lower() in {".jpg", ".jpeg"}:
                 self.log("Note: Source was JPEG. Bits are saved losslessly to PNG as '..._stego.png'. Re-saving as JPEG will corrupt hidden data.")
-            QMessageBox.information(self, "Encode complete",
+            QtWidgets.QMessageBox.information(
+                self, "Encode complete",
                 f"Embedded {len(payload)} bytes (encrypted) with a {len(header)}-byte header.\n"
-                f"Saved: {out_path}\nCopy the Final Key for decoding.")
+                f"Saved: {out_path}\nFinal Key is shown above."
+            )
+
         except Exception as e:
             self.error(str(e))
-
-
+    
+    # --------- helpers for logging/errors ----------
     def log(self, msg: str):
         self.log_edit.append(msg)
 
@@ -1340,6 +1560,14 @@ class ImageDecodeTab(QWidget):
 
         root.addWidget(media_box); root.addWidget(ctrl); root.addLayout(btns); root.addWidget(log_box)
 
+        # --------- helpers for logging/errors ----------
+    def log(self, msg: str):
+        self.log_edit.append(msg)
+
+    def error(self, msg: str):
+        QMessageBox.critical(self, "Error", msg)
+        self.log(f"[ERROR] {msg}")
+
     def load_stego(self, path: str):
         try:
             ext = Path(path).suffix.lower()
@@ -1354,22 +1582,24 @@ class ImageDecodeTab(QWidget):
     def on_inspect(self):
         if not self.stego_path:
             self.error("Load a stego image first."); return
-        token = self.key_token_edit.text().strip()
+        token    = self.key_token_edit.text().strip()
         user_key = self.user_key_edit.text().strip()
         if not token or not user_key:
             self.error("Provide both Final Key token and the user key."); return
+
         try:
             info = parse_key_token(token)
             if info["media_kind"] != "image":
                 self.error("Final Key is not for an image."); return
 
-            im = Image.open(self.stego_path)
+            im  = Image.open(self.stego_path)
             ext = Path(self.stego_path).suffix.lower()
 
-            # ---- prep buffers/geometry (no quantize!) ----
+            # Prepare buffers/geometry
+            chosen_palette = None
             if ext == ".gif":
                 im.seek(0)
-                frame_bufs, imgW, imgH, channels, durations, base_info = _gif_read_full_buffers(im)
+                frame_bufs, imgW, imgH, channels, durations, base_info, chosen_palette = _gif_read_full_buffers(im)
                 n_frames = len(frame_bufs)
                 W, H = imgW, imgH
             else:
@@ -1383,154 +1613,19 @@ class ImageDecodeTab(QWidget):
             if w <= 0 or h <= 0 or x0 < 0 or y0 < 0 or x0+w > W or y0+h > H:
                 self.error("Token ROI is out of bounds for this image."); return
 
+            # KDF & quick key check
             kd = kdf_from_key(user_key, info["salt16"])
             K_perm, K_bit, K_crypto, K_check, nonce = kd["K_perm"], kd["K_bit"], kd["K_crypto"], kd["K_check"], kd["nonce"]
             if K_check != info["kcheck4"]:
                 self.error("Wrong user key for this Final Key (K_check mismatch)."); return
 
-            lsb = info["lsb"]; rot = K_bit[0] % lsb
-            slots_per_frame = w * h * channels
-            slots_total = slots_per_frame * n_frames
-            target_bits = 84 * 8
-            if target_bits > slots_total * lsb:
-                self.error("Stego ROI cannot even hold a header; file/token mismatch."); return
-            perm = _make_perm(slots_total, K_perm)
+            lsb = info["lsb"]
+            HEADER_BITS = 84 * 8
 
-            bits = []
-            for i_bit in range(target_bits):
-                slot_index = i_bit // lsb
-                plane = ((i_bit % lsb) + rot) % lsb
-
-                s = perm[slot_index]
-                fidx = s // slots_per_frame
-                rem  = s %  slots_per_frame
-
-                if channels == 1:
-                    px = rem
-                    rel_x = px % w
-                    rel_y = px // w
-                    x = x0 + rel_x
-                    y = y0 + rel_y
-                    idx = (y * imgW + x)
-                else:
-                    px = rem // channels
-                    c  = rem % channels
-                    rel_x = px % w
-                    rel_y = px // w
-                    x = x0 + rel_x
-                    y = y0 + rel_y
-                    idx = _pixel_byte_index(x, y, c, imgW, channels)
-
-                bits.append(_get_bit(frame_bufs[fidx][idx], plane))
-
-            # bits → bytes
-            b = bytearray()
-            for i in range(0, len(bits), 8):
-                byte = 0
-                for k in range(8):
-                    byte = (byte << 1) | bits[i+k]
-                b.append(byte)
-
-            hdr = parse_header(bytes(b))
-            if hdr["lsb"] != lsb or hdr["roi"] != tuple(info["roi"]):
-                self.error("Header mismatch (ROI/LSB do not match Final Key)."); return
-            if hdr["salt16"] != info["salt16"]:
-                self.error("Header salt does not match Final Key salt."); return
-
-            self.log(f"Header OK. version={hdr['version']} payload_len={hdr['payload_len']}")
-            self.log(f"salt16={hdr['salt16'].hex()} nonce12={hdr['nonce12'].hex()} cover_fp16={hdr['cover_fp16'].hex()}")
-            QMessageBox.information(self, "Inspect",
-                f"Header read OK.\nPayload length: {hdr['payload_len']} bytes.\nReady to decode.")
-        except Exception as e:
-            self.error(str(e))
-
-    def on_decode(self):
-        if not self.stego_path:
-            self.error("Load a stego image first."); return
-        token = self.key_token_edit.text().strip()
-        user_key = self.user_key_edit.text().strip()
-        if not token or not user_key:
-            self.error("Provide both Final Key token and the user key."); return
-
-        try:
-            info = parse_key_token(token)
-            if info["media_kind"] != "image":
-                self.error("Final Key is not for an image."); return
-
-            im = Image.open(self.stego_path)
-            ext = Path(self.stego_path).suffix.lower()
-
-            # ---- prepare buffers / geometry (GIF multi-frame vs single) ----
-            if ext == ".gif":
-                im.seek(0)
-                # CRITICAL: do NOT quantize here, just read existing indices
-                frame_bufs, imgW, imgH, channels, durations, base_info = _gif_read_full_buffers(im)
-                n_frames = len(frame_bufs)
-                W, H = imgW, imgH
-            else:
-                conv, channels, mode = _ensure_8bit_mode(im)
-                buf, imgW, imgH, ch = _img_bytes_and_geometry(conv)
-                frame_bufs = [buf]
-                n_frames = 1
-                W, H = imgW, imgH
-
-            x0, y0, w, h = info["roi"]
-            if w <= 0 or h <= 0 or x0 < 0 or y0 < 0 or x0+w > W or y0+h > H:
-                self.error("Token ROI is out of bounds for this image."); return
-
-            kd = kdf_from_key(user_key, info["salt16"])
-            K_perm, K_bit, K_crypto, K_check, _nonce_from_kdf = (
-                kd["K_perm"], kd["K_bit"], kd["K_crypto"], kd["K_check"], kd["nonce"]
+            header_bytes = _read_bits_from_buffers(
+                frame_bufs, imgW, imgH, channels, info["roi"], lsb, K_perm, K_bit,
+                HEADER_BITS, 0, palette=chosen_palette if channels == 1 else None
             )
-            if K_check != info["kcheck4"]:
-                self.error("Wrong user key for this Final Key (K_check mismatch)."); return
-
-            lsb = info["lsb"]; rot = K_bit[0] % lsb
-            slots_per_frame = w * h * channels
-            slots_total = slots_per_frame * n_frames
-            perm = _make_perm(slots_total, K_perm)
-
-            def _read_bits(n_bits: int, start_bit: int = 0) -> bytes:
-                if n_bits + start_bit > slots_total * lsb:
-                    raise ValueError("Requested bits exceed ROI capacity.")
-                bits = []
-                for i_bit in range(start_bit, start_bit + n_bits):
-                    slot_index = i_bit // lsb
-                    plane = ((i_bit % lsb) + rot) % lsb
-
-                    s = perm[slot_index]
-                    fidx = s // slots_per_frame
-                    rem  = s %  slots_per_frame
-
-                    if channels == 1:
-                        px = rem
-                        rel_x = px % w
-                        rel_y = px // w
-                        x = x0 + rel_x
-                        y = y0 + rel_y
-                        idx = (y * imgW + x)
-                    else:
-                        px = rem // channels
-                        c  = rem % channels
-                        rel_x = px % w
-                        rel_y = px // w
-                        x = x0 + rel_x
-                        y = y0 + rel_y
-                        idx = _pixel_byte_index(x, y, c, imgW, channels)
-
-                    bits.append(_get_bit(frame_bufs[fidx][idx], plane))
-
-                out = bytearray()
-                for i in range(0, len(bits), 8):
-                    byte = 0
-                    for k in range(8):
-                        byte = (byte << 1) | bits[i+k]
-                    out.append(byte)
-                return bytes(out)
-
-            # --- header then payload ---
-            HEADER_BYTES = 84
-            header_bytes = _read_bits(HEADER_BYTES * 8, start_bit=0)
             hdr = parse_header(header_bytes)
 
             if hdr["lsb"] != lsb or hdr["roi"] != tuple(info["roi"]):
@@ -1538,19 +1633,88 @@ class ImageDecodeTab(QWidget):
             if hdr["salt16"] != info["salt16"]:
                 self.error("Header salt does not match Final Key salt."); return
 
-            payload_len = hdr["payload_len"]
-            total_bits_needed = (HEADER_BYTES + payload_len) * 8
+            self.log(f"Header OK. version={hdr['version']} payload_len={hdr['payload_len']}")
+            self.log(f"salt16={hdr['salt16'].hex()} nonce12={hdr['nonce12'].hex()} cover_fp16={hdr['cover_fp16'].hex()}")
+            QtWidgets.QMessageBox.information(
+                self, "Inspect",
+                f"Header read OK.\nPayload length: {hdr['payload_len']} bytes.\nReady to decode."
+            )
+        except Exception as e:
+            self.error(str(e))
+
+
+    def on_decode(self):
+        if not self.stego_path:
+            self.error("Load a stego image first."); return
+        token    = self.key_token_edit.text().strip()
+        user_key = self.user_key_edit.text().strip()
+        if not token or not user_key:
+            self.error("Provide both Final Key token and the user key."); return
+
+        try:
+            info = parse_key_token(token)
+            if info["media_kind"] != "image":
+                self.error("Final Key is not for an image."); return
+
+            im  = Image.open(self.stego_path)
+            ext = Path(self.stego_path).suffix.lower()
+
+            # Prepare buffers / geometry
+            chosen_palette = None
+            if ext == ".gif":
+                im.seek(0)
+                frame_bufs, imgW, imgH, channels, durations, base_info, chosen_palette = _gif_read_full_buffers(im)
+                n_frames = len(frame_bufs)
+                W, H = imgW, imgH
+            else:
+                conv, channels, mode = _ensure_8bit_mode(im)
+                buf, imgW, imgH, ch = _img_bytes_and_geometry(conv)
+                frame_bufs = [buf]
+                n_frames = 1
+                W, H = imgW, imgH
+
+            x0, y0, w, h = info["roi"]
+            if w <= 0 or h <= 0 or x0 < 0 or y0 < 0 or x0+w > W or y0+h > H:
+                self.error("Token ROI is out of bounds for this image."); return
+
+            # KDF & key check
+            kd = kdf_from_key(user_key, info["salt16"])
+            K_perm, K_bit, K_crypto, K_check, _nonce_from_kdf = (
+                kd["K_perm"], kd["K_bit"], kd["K_crypto"], kd["K_check"], kd["nonce"]
+            )
+            if K_check != info["kcheck4"]:
+                self.error("Wrong user key for this Final Key (K_check mismatch)."); return
+
+            lsb = info["lsb"]
+            HEADER_BITS = 84 * 8
+
+            # Read header then payload
+            header_bytes = _read_bits_from_buffers(
+                frame_bufs, imgW, imgH, channels, info["roi"], lsb, K_perm, K_bit,
+                HEADER_BITS, 0, palette=chosen_palette if channels == 1 else None
+            )
+            hdr = parse_header(header_bytes)
+
+            if hdr["lsb"] != lsb or hdr["roi"] != tuple(info["roi"]):
+                self.error("Header mismatch (ROI/LSB do not match Final Key)."); return
+            if hdr["salt16"] != info["salt16"]:
+                self.error("Header salt does not match Final Key salt."); return
+
+            total_bits_needed = (84 + hdr["payload_len"]) * 8
+            slots_total = w * h * channels * (len(frame_bufs))
             if total_bits_needed > slots_total * lsb:
                 self.error("Stego does not contain the declared payload length (capacity shortfall)."); return
 
-            cipher_bytes = _read_bits(payload_len * 8, start_bit=HEADER_BYTES * 8)
+            cipher_bytes = _read_bits_from_buffers(
+                frame_bufs, imgW, imgH, channels, info["roi"], lsb, K_perm, K_bit,
+                hdr["payload_len"] * 8, HEADER_BITS, palette=chosen_palette if channels == 1 else None
+            )
 
             ks = _hmac_keystream(K_crypto, hdr["nonce12"], len(cipher_bytes))
             payload = _xor(cipher_bytes, ks)
 
-            out_dir = Path(self.stego_path).parent
+            out_dir  = Path(self.stego_path).parent
             out_base = Path(self.stego_path).stem
-
             ext_guess, label, is_text = guess_image_or_text_ext(payload)
             dest = out_dir / f"{out_base}_payload{ext_guess}"
 
@@ -1563,10 +1727,12 @@ class ImageDecodeTab(QWidget):
                     f.write(payload)
 
             self.log(f"Saved payload as {dest} ({label}, {human_bytes(len(payload))})")
-            QMessageBox.information(self, "Decode complete",
-                                    f"Recovered {len(payload)} bytes.\nDetected: {label}\nSaved to:\n{dest}")
+            QtWidgets.QMessageBox.information(
+                self, "Decode complete",
+                f"Recovered {len(payload)} bytes.\nDetected: {label}\nSaved to:\n{dest}"
+            )
 
-            # --- optional: auto-load original cover (unchanged) ---
+            # Optional: auto-load original cover (unchanged)
             cover_guess = None
             try:
                 meta = Path(self.stego_path).with_suffix(".meta")
@@ -1610,13 +1776,6 @@ class ImageDecodeTab(QWidget):
         except Exception as e:
             self.error(str(e))
 
-
-    def log(self, msg: str):
-        self.log_edit.append(msg)
-
-    def error(self, msg: str):
-        QMessageBox.critical(self, "Error", msg)
-        self.log(f"[ERROR] {msg}")
 
 
 # ---------- Suite ----------
