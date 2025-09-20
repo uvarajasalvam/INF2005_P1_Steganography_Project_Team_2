@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QTextEdit, QRubberBand, QSlider
 )
 import fitz  # PyMuPDF
+import tempfile
 
 # ---------- File types ----------
 IMAGE_EXTS = {
@@ -127,6 +128,18 @@ def parse_key_token(token: str) -> dict:
     return {"media_kind": media_kind, "lsb": lsb, "roi": (x0,y0,w,h), "salt16": salt16, "kcheck4": kcheck4}
 
 # ---------- Stego helpers ----------
+def _save_temp_png(pil_img: Image.Image, prefix: str = "stego_") -> Path:
+    """
+    Save a PIL image to a temporary PNG file and return its Path.
+    The caller is responsible for deleting the file when done.
+    """
+    # On Windows, NamedTemporaryFile must be closed before reopening.
+    with tempfile.NamedTemporaryFile(prefix=prefix, suffix=".png", delete=False) as tmp:
+        path = Path(tmp.name)
+    pil_img.convert("RGBA").save(path, "PNG")
+    return path
+
+
 def pil_to_qpixmap(img: Image.Image) -> QPixmap:
     # Convert a PIL Image to QPixmap for preview
     data = img.convert("RGBA").tobytes("raw", "RGBA")
@@ -1205,6 +1218,8 @@ class ImageEncodeTab(QWidget):
         self.roi_img = None
 
         left = QVBoxLayout()
+
+        # --- Cover box ---
         cov_box = QGroupBox("Cover Image")
         cv = QVBoxLayout()
         self.cover_drop = DropLabel("an image (.bmp/.png/.gif/.jpg/.jpeg)", IMAGE_EXTS)
@@ -1213,27 +1228,40 @@ class ImageEncodeTab(QWidget):
         cv.addWidget(self.cover_drop); cv.addWidget(self.cover_info)
         cov_box.setLayout(cv)
 
+        # --- Payload box ---
         pay_box = QGroupBox("Payload (Text or File)")
         self.payload_panel = PayloadPanel(self.update_capacity_label)
         pay_v = QVBoxLayout(); pay_v.addWidget(self.payload_panel); pay_box.setLayout(pay_v)
 
+        # --- Embedding Controls (keep a reference to the form) ---
         ctrl = QGroupBox("Embedding Controls")
-        form = QFormLayout()
-        self.lsb_slider = QSlider(Qt.Horizontal); self.lsb_slider.setRange(1,8); self.lsb_slider.setValue(1)
+        self.form = QFormLayout()  # <— keep this for toggling the Page row
+
+        self.lsb_slider = QSlider(Qt.Horizontal)
+        self.lsb_slider.setRange(1, 8)
+        self.lsb_slider.setValue(1)
         self.lsb_value = QLabel("1")
         self.lsb_slider.valueChanged.connect(lambda v: self.lsb_value.setText(str(v)))
         self.lsb_slider.valueChanged.connect(self.update_capacity_label)
-        self.key_edit = QLineEdit(); self.key_edit.setPlaceholderText("Enter numeric/passphrase key (required)")
-        lrow = QHBoxLayout(); lrow.addWidget(self.lsb_slider,1); lrow.addWidget(self.lsb_value,0)
-        lwrap = QWidget(); lwrap.setLayout(lrow)
-        form.addRow("Number of LSBs:", lwrap)
-        form.addRow("Key:", self.key_edit)
-        ctrl.setLayout(form)
 
+        self.key_edit = QLineEdit()
+        self.key_edit.setPlaceholderText("Enter numeric/passphrase key (required)")
+
+        lrow = QHBoxLayout()
+        lrow.addWidget(self.lsb_slider, 1)
+        lrow.addWidget(self.lsb_value, 0)
+        lwrap = QWidget(); lwrap.setLayout(lrow)
+
+        self.form.addRow("Number of LSBs:", lwrap)
+        self.form.addRow("Key:", self.key_edit)
+        ctrl.setLayout(self.form)
+
+        # --- Capacity box ---
         cap_box = QGroupBox("Capacity")
         self.cap_label = QLabel("Load cover + select ROI + add payload."); self.cap_label.setWordWrap(True)
         cap_v = QVBoxLayout(); cap_v.addWidget(self.cap_label); cap_box.setLayout(cap_v)
 
+        # --- Final Key box ---
         key_box = QGroupBox("Final Key (copy for decoding)")
         key_h = QHBoxLayout()
         self.key_token_edit = QLineEdit(); self.key_token_edit.setReadOnly(True)
@@ -1241,14 +1269,22 @@ class ImageEncodeTab(QWidget):
         key_h.addWidget(self.key_token_edit); key_h.addWidget(self.copy_btn)
         key_box.setLayout(key_h)
 
+        # --- Encode button row ---
         btns = QHBoxLayout()
         self.encode_btn = QPushButton("Derive Key & Encode (Placeholder)")
         self.encode_btn.clicked.connect(self.on_encode)
         btns.addWidget(self.encode_btn)
 
-        left.addWidget(cov_box); left.addWidget(pay_box); left.addWidget(ctrl)
-        left.addWidget(cap_box); left.addWidget(key_box); left.addLayout(btns); left.addStretch(1)
+        # --- Left stack ---
+        left.addWidget(cov_box)
+        left.addWidget(pay_box)
+        left.addWidget(ctrl)
+        left.addWidget(cap_box)
+        left.addWidget(key_box)
+        left.addLayout(btns)
+        left.addStretch(1)
 
+        # --- Right: preview + log ---
         right = QVBoxLayout()
         prev_box = QGroupBox("Image Preview (drag ROI)")
         pv = QVBoxLayout()
@@ -1283,9 +1319,16 @@ class ImageEncodeTab(QWidget):
         self.page_value.setVisible(False)
 
         self.page_slider.valueChanged.connect(lambda v: self._on_pdf_page_changed(v))
-        prow = QHBoxLayout(); prow.addWidget(self.page_slider, 1); prow.addWidget(self.page_value, 0)
+
+        prow = QHBoxLayout()
+        prow.addWidget(self.page_slider, 1)
+        prow.addWidget(self.page_value, 0)
         prow_wrap = QWidget(); prow_wrap.setLayout(prow)
-        form.addRow("Page:", prow_wrap)  # put after the "Number of LSBs" row
+
+        self.page_label = QLabel("Page:")   # <— a real label we can hide/show
+        self.page_label.setVisible(False)   # <— hidden unless PDF
+        self.form.addRow(self.page_label, prow_wrap)
+
 
     def _on_pdf_page_changed(self, v: int):
     # v is 1-based for UI; store 0-based
@@ -1340,6 +1383,7 @@ class ImageEncodeTab(QWidget):
                 # Show/enable page controls
                 self.page_slider.setVisible(True)
                 self.page_value.setVisible(True)
+                self.page_label.setVisible(True)
                 self.page_slider.setRange(1, max(1, self.pdf_page_count))
                 self.page_slider.setValue(1)
                 self.pdf_page_index = 0  # 0-based
@@ -1428,6 +1472,7 @@ class ImageEncodeTab(QWidget):
                 # Hide PDF page controls (in case a PDF was loaded earlier)
                 self.page_slider.setVisible(False)
                 self.page_value.setVisible(False)
+                self.page_label.setVisible(False) 
 
                 # Reset ROI/capacity UI
                 self.roi_img = None
@@ -1440,6 +1485,7 @@ class ImageEncodeTab(QWidget):
             # Hide PDF page controls (in case a PDF was loaded earlier)
             self.page_slider.setVisible(False)
             self.page_value.setVisible(False)
+            self.page_label.setVisible(False) 
 
             qpix = QPixmap(path)
             if qpix.isNull():
@@ -2068,104 +2114,98 @@ class ImageDecodeTab(QWidget):
 
             # ---------- PDF branch ----------
             if ext == ".pdf":
-                # 1) decide which page to try first
-                #    a) meta file page=... (1-based) wins
-                #    b) otherwise use UI (if present) 0-based
-                #    c) if still not found, scan all pages for STG1
-                first_page_idx = getattr(self, "pdf_page_index", 0)
-                try:
-                    meta = Path(self.stego_path).with_suffix(".meta")
-                    if meta.exists():
-                        for line in meta.read_text(encoding="utf-8").splitlines():
+                # prefer the page in .meta if present
+                page_idx = 0
+                meta_path = Path(self.stego_path).with_suffix(".meta")
+                if meta_path.exists():
+                    try:
+                        for line in meta_path.read_text(encoding="utf-8").splitlines():
                             if line.lower().startswith("page="):
                                 v = int(line.split("=",1)[1].strip())
                                 if v >= 1:
-                                    first_page_idx = v - 1
+                                    page_idx = v - 1
                                 break
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
 
-                # 2) KDF & key check once
-                kd = kdf_from_key(user_key, info["salt16"])
-                K_perm, K_bit, K_crypto, K_check, _nonce_from_kdf = (
-                    kd["K_perm"], kd["K_bit"], kd["K_crypto"], kd["K_check"], kd["nonce"]
-                )
-                if K_check != info["kcheck4"]:
-                    self.error("Wrong user key for this Final Key (K_check mismatch)."); return
-
-                lsb = info["lsb"]
-                HEADER_BITS = 84 * 8
-
-                def try_page(pidx: int):
-                    pil_base, (imgW, imgH) = render_pdf_page_to_pil(self.stego_path, pidx, dpi=200)
-                    conv, channels, _mode = _ensure_8bit_mode(pil_base)
+                # --- attempt the hinted page first, then scan all pages if needed ---
+                def try_decode_page(pindex: int):
+                    pil_base, (imgW, imgH) = render_pdf_page_to_pil(self.stego_path, pindex, dpi=200)
+                    conv, channels, mode = _ensure_8bit_mode(pil_base)
                     buf, rW, rH, ch = _img_bytes_and_geometry(conv)
                     frame_bufs = [buf]
                     x0, y0, w, h = info["roi"]
-                    if w <= 0 or h <= 0 or x0 < 0 or y0 < 0 or x0+w > rW or y0+h > rH:
-                        return None, None, None
+                    lsb = info["lsb"]
+
+                    header_bytes = _read_bits_from_buffers(
+                        frame_bufs, rW, rH, channels, info["roi"], lsb,
+                        kdf_from_key(user_key, info["salt16"])["K_perm"],
+                        kdf_from_key(user_key, info["salt16"])["K_bit"],
+                        84 * 8, 0, palette=None
+                    )
+                    hdr_local = parse_header(header_bytes)
+                    return hdr_local, (frame_bufs, rW, rH, channels)
+
+                # KDF once
+                kd = kdf_from_key(user_key, info["salt16"])
+                K_perm, K_bit, K_crypto, K_check, _nonce_from_kdf = kd["K_perm"], kd["K_bit"], kd["K_crypto"], kd["K_check"], kd["nonce"]
+                if K_check != info["kcheck4"]:
+                    self.error("Wrong user key for this Final Key (K_check mismatch)."); return
+
+                # try hinted page
+                header_ok = False
+                page_with_header = None
+                frame_bufs = None; rW = rH = channels = None
+                try:
+                    pil_base, (imgW, imgH) = render_pdf_page_to_pil(self.stego_path, page_idx, dpi=200)
+                    conv, channels, mode = _ensure_8bit_mode(pil_base)
+                    buf, rW, rH, ch = _img_bytes_and_geometry(conv)
+                    frame_bufs = [buf]
+                    x0, y0, w, h = info["roi"]
+                    lsb = info["lsb"]
                     header_bytes = _read_bits_from_buffers(
                         frame_bufs, rW, rH, channels, info["roi"], lsb, K_perm, K_bit,
-                        HEADER_BITS, 0, palette=None
+                        84 * 8, 0, palette=None
                     )
-                    return header_bytes, (rW, rH, channels), frame_bufs
-
-                def looks_like_header(b: bytes) -> bool:
-                    return len(b) >= 4 and b[:4] == b"STG1"
-
-                #self.log(f"DEBUG decode(pdf): trying page={first_page_idx+1}")
-                hb, dims, fbufs = try_page(first_page_idx)
-                good_page = None
-
-                if hb is None or not looks_like_header(hb):
+                    hdr = parse_header(header_bytes)
+                    header_ok = True
+                    page_with_header = page_idx
+                except Exception:
                     # scan all pages
-                    #self.log("DEBUG decode(pdf): first guess failed; scanning all pages for STG1…")
-                    try:
-                        import fitz
-                        doc = fitz.open(self.stego_path)
-                        total = len(doc)
-                        doc.close()
-                    except Exception as e:
-                        self.error(f"Cannot open PDF to count pages: {e}"); return
-
-                    for pidx in range(total):
-                        hb2, dims2, fbufs2 = try_page(pidx)
-                        if hb2 is None:
-                            continue
-                        if looks_like_header(hb2):
-                            good_page, hb, dims, fbufs = pidx, hb2, dims2, fbufs2
-                            #self.log(f"DEBUG decode(pdf): found STG1 on page {pidx+1}")
+                    doc = fitz.open(self.stego_path)
+                    n_pages = len(doc)
+                    doc.close()
+                    for p in range(n_pages):
+                        try:
+                            pil_base, (imgW, imgH) = render_pdf_page_to_pil(self.stego_path, p, dpi=200)
+                            conv, channels, mode = _ensure_8bit_mode(pil_base)
+                            buf, rW, rH, ch = _img_bytes_and_geometry(conv)
+                            frame_bufs = [buf]
+                            header_bytes = _read_bits_from_buffers(
+                                frame_bufs, rW, rH, channels, info["roi"], info["lsb"], K_perm, K_bit,
+                                84 * 8, 0, palette=None
+                            )
+                            hdr = parse_header(header_bytes)
+                            header_ok = True
+                            page_with_header = p
                             break
+                        except Exception:
+                            continue
 
-                    if good_page is None:
-                        self.error("Could not find a valid STG1 header on any page of this PDF.\n"
-                                "Ensure you’re opening the stego PDF and using the matching Final Key/ROI/LSB.")
-                        return
-                else:
-                    good_page = first_page_idx
-                    #self.log("DEBUG decode(pdf): STG1 found on first try.")
+                if not header_ok:
+                    self.error("Could not find a valid STG1 header on any page of this PDF.\nEnsure you’re opening the stego PDF and using the matching Final Key/ROI/LSB.")
+                    return
 
-                #self.log(f"DEBUG header[0:8]={hb[:8].hex()} len={len(hb)}")
-                try:
-                    hdr = parse_header(hb)
-                except Exception as e:
-                    self.error(f"Header parse failed on page {good_page+1}: {e}"); return
-
-                if hdr["lsb"] != lsb or hdr["roi"] != tuple(info["roi"]):
-                    self.error("Header mismatch (ROI/LSB do not match Final Key)."); return
-                if hdr["salt16"] != info["salt16"]:
-                    self.error("Header salt does not match Final Key salt."); return
-
-                rW, rH, channels = dims
-                x0, y0, w, h = info["roi"]
+                # read payload
                 total_bits_needed = (84 + hdr["payload_len"]) * 8
+                x0, y0, w, h = info["roi"]
                 slots_total = w * h * channels
-                if total_bits_needed > slots_total * lsb:
+                if total_bits_needed > slots_total * info["lsb"]:
                     self.error("Stego does not contain the declared payload length (capacity shortfall)."); return
 
                 cipher_bytes = _read_bits_from_buffers(
-                    fbufs, rW, rH, channels, info["roi"], lsb, K_perm, K_bit,
-                    hdr["payload_len"] * 8, HEADER_BITS, palette=None
+                    frame_bufs, rW, rH, channels, info["roi"], info["lsb"], K_perm, K_bit,
+                    hdr["payload_len"] * 8, 84 * 8, palette=None
                 )
                 ks = _hmac_keystream(K_crypto, hdr["nonce12"], len(cipher_bytes))
                 payload = _xor(cipher_bytes, ks)
@@ -2173,7 +2213,6 @@ class ImageDecodeTab(QWidget):
                 out_base = Path(self.stego_path).stem
                 ext_guess, label, is_text = guess_image_or_text_ext(payload)
                 dest = source_dir / f"{out_base}_payload{ext_guess}"
-
                 if is_text and ext_guess == ".txt":
                     txt = payload.decode("utf-8", errors="strict")
                     with open(dest, "w", encoding="utf-8") as f:
@@ -2185,9 +2224,70 @@ class ImageDecodeTab(QWidget):
                 self.log(f"Saved payload as {dest} ({label}, {human_bytes(len(payload))})")
                 QtWidgets.QMessageBox.information(
                     self, "Decode complete",
-                    f"Recovered {len(payload)} bytes from PDF page {good_page+1}.\n"
+                    f"Recovered {len(payload)} bytes from PDF page {page_with_header+1}.\n"
                     f"Detected: {label}\nSaved to:\n{dest}"
                 )
+
+                # ---- Preview dialog for PDF using .meta to load original cover page ----
+                # left/stego: render current stego page to a temp PNG
+                stego_tmp = None
+                try:
+                    pil_stego, _sz = render_pdf_page_to_pil(self.stego_path, page_with_header, dpi=200)
+                    stego_tmp = Path(tempfile.gettempdir()) / f"stego_pdf_preview_{os.getpid()}_{page_with_header+1}.png"
+                    pil_stego.convert("RGBA").save(stego_tmp, "PNG")
+                except Exception:
+                    stego_tmp = None
+
+                cover_img_path = None
+                cover_cleanup = None
+                try:
+                    if meta_path.exists():
+                        # meta line 0 = original cover path, optional page= on a later line
+                        lines = meta_path.read_text(encoding="utf-8").splitlines()
+                        cover_line = lines[0].strip() if lines else ""
+                        cover_path = cover_line if cover_line else None
+                        meta_page = None
+                        for ln in lines[1:]:
+                            if ln.lower().startswith("page="):
+                                try:
+                                    v = int(ln.split("=",1)[1].strip())
+                                    if v >= 1:
+                                        meta_page = v - 1
+                                except Exception:
+                                    pass
+                                break
+                        use_page = page_with_header if meta_page is None else meta_page
+                        if cover_path and Path(cover_path).exists() and Path(cover_path).suffix.lower() == ".pdf":
+                            pil_cover, _ = render_pdf_page_to_pil(cover_path, use_page, dpi=200)
+                            tmpc = Path(tempfile.gettempdir()) / f"cover_pdf_preview_{os.getpid()}_{use_page+1}.png"
+                            pil_cover.convert("RGBA").save(tmpc, "PNG")
+                            cover_img_path = str(tmpc)
+                            def _cleanup():
+                                try: tmpc.unlink(missing_ok=True)
+                                except Exception: pass
+                            cover_cleanup = _cleanup
+                except Exception:
+                    pass
+
+                try:
+                    dlg = DecodePreviewDialog(
+                        stego_path=str(stego_tmp) if stego_tmp and stego_tmp.exists() else self.stego_path,
+                        payload_path=str(dest),
+                        payload_label=label,
+                        is_text=is_text,
+                        cover_path=cover_img_path
+                    )
+                    dlg.exec()
+                finally:
+                    try:
+                        if stego_tmp and stego_tmp.exists():
+                            stego_tmp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    if cover_cleanup:
+                        try: cover_cleanup()
+                        except Exception: pass
+
                 return
 
             # ---------- GIF branch ----------
@@ -2221,7 +2321,7 @@ class ImageDecodeTab(QWidget):
                     self.error("Header salt does not match Final Key salt."); return
 
                 total_bits_needed = (84 + hdr["payload_len"]) * 8
-                slots_total = w * h * channels * (len(frame_bufs))
+                slots_total = w * h * channels * len(frame_bufs)
                 if total_bits_needed > slots_total * lsb:
                     self.error("Stego does not contain the declared payload length (capacity shortfall)."); return
 
@@ -2251,30 +2351,23 @@ class ImageDecodeTab(QWidget):
                     f"Recovered {len(payload)} bytes.\nDetected: {label}\nSaved to:\n{dest}"
                 )
 
-                # Optional preview dialog (unchanged)
-                cover_guess = None
+                # original cover from .meta (if present)
+                cover_path = None
                 try:
-                    meta = Path(self.stego_path).with_suffix(".meta")
-                    if meta.exists():
-                        candidate = meta.read_text(encoding="utf-8").strip()
+                    meta_path = Path(self.stego_path).with_suffix(".meta")
+                    if meta_path.exists():
+                        candidate = meta_path.read_text(encoding="utf-8").splitlines()[0].strip()
                         if candidate and Path(candidate).exists():
-                            try:
-                                if cover_fingerprint(candidate) == hdr["cover_fp16"]:
-                                    cover_guess = candidate
-                                    self.log(f"Auto-loaded cover from meta: {cover_guess}")
-                                else:
-                                    self.log("[WARN] Meta cover fingerprint mismatch; not auto-loading.")
-                            except Exception as _ve:
-                                self.log(f"[WARN] Could not verify meta cover fingerprint: {_ve}")
-                except Exception as _e:
-                    self.log(f"[WARN] Auto-cover lookup failed: {_e}")
+                            cover_path = candidate
+                except Exception:
+                    cover_path = None
 
                 dlg = DecodePreviewDialog(
                     stego_path=self.stego_path,
                     payload_path=str(dest),
                     payload_label=label,
                     is_text=is_text,
-                    cover_path=cover_guess
+                    cover_path=cover_path
                 )
                 dlg.exec()
                 return
@@ -2340,36 +2433,28 @@ class ImageDecodeTab(QWidget):
                 f"Recovered {len(payload)} bytes.\nDetected: {label}\nSaved to:\n{dest}"
             )
 
-            # Optional preview dialog (unchanged)
-            cover_guess = None
+            # original cover from .meta (if present)
+            cover_path = None
             try:
-                meta = Path(self.stego_path).with_suffix(".meta")
-                if meta.exists():
-                    candidate = meta.read_text(encoding="utf-8").strip()
+                meta_path = Path(self.stego_path).with_suffix(".meta")
+                if meta_path.exists():
+                    candidate = meta_path.read_text(encoding="utf-8").splitlines()[0].strip()
                     if candidate and Path(candidate).exists():
-                        try:
-                            if cover_fingerprint(candidate) == hdr["cover_fp16"]:
-                                cover_guess = candidate
-                                self.log(f"Auto-loaded cover from meta: {cover_guess}")
-                            else:
-                                self.log("[WARN] Meta cover fingerprint mismatch; not auto-loading.")
-                        except Exception as _ve:
-                            self.log(f"[WARN] Could not verify meta cover fingerprint: {_ve}")
-            except Exception as _e:
-                self.log(f"[WARN] Auto-cover lookup failed: {_e}")
+                        cover_path = candidate
+            except Exception:
+                cover_path = None
 
             dlg = DecodePreviewDialog(
                 stego_path=self.stego_path,
                 payload_path=str(dest),
                 payload_label=label,
                 is_text=is_text,
-                cover_path=cover_guess
+                cover_path=cover_path
             )
             dlg.exec()
 
         except Exception as e:
             self.error(str(e))
-
 
 
 
