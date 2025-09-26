@@ -6,6 +6,7 @@ from typing import NamedTuple
 import numpy as np
 from numpy.random import PCG64, Generator
 
+from PySide6 import QtCore
 from PySide6.QtCore import Qt, Signal
 import PySide6.QtGui as QtGui
 import PySide6.QtWidgets as QtWidgets
@@ -1190,112 +1191,116 @@ class AudioDecodeTab(QWidget):
     def on_decode(self):
         if not self.stego_path:
             self.error("Load a stego audio file first."); return
+
         ext = Path(self.stego_path).suffix.lower()
         user_key = self.user_key_edit.text().strip()
         if not user_key:
             self.error("Enter the key/passphrase."); return
 
+        # --- helper: try to guess a cover sibling (optional) ---
+        def _guess_cover_for(stego_path: str) -> str | None:
+            p = Path(stego_path)
+            # common pattern we created on encode: *_stego.*  -> try to find original stem
+            stem = p.stem
+            base = stem.replace("_stego", "")
+            for sx in (".wav", ".flac", ".ogg", ".mp3"):
+                cand = p.with_name(base + sx)
+                if cand.is_file() and str(cand) != stego_path:
+                    return str(cand)
+            return None
+
+        # ========== MP3 route (MP3Stego) ==========
         if ext == ".mp3":
             try:
                 payload_bytes = MP3STEGO.extract(self.stego_path, user_key)
                 self.log(f"[MP3Stego] Extracted {len(payload_bytes)} bytes; head={payload_bytes[:16].hex()}")
 
-                # Try to parse our envelope first
+                # Prefer our envelope (supports binary + filename)
                 unwrapped = mp3_unwrap_payload(payload_bytes)
                 if unwrapped is not None:
                     meta, data = unwrapped
-                    mode = int(meta.get("mode", 0))
+                    mode = int(meta.get("mode", 0))   # 0=text, 1=binary
                     fname = meta.get("filename") or ("payload.txt" if mode == 0 else "payload.bin")
 
-                    if mode == 0:
-                        # text -> show + optional save
-                        try:
-                            text = data.decode("utf-8")
-                            self._show_text_preview(text, len(data))
-                            if QMessageBox.question(
-                                self, "Save text?",
-                                f"Recovered text ({len(data)} bytes). Save to file '{fname}'?",
-                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-                            ) == QMessageBox.Yes:
-                                self._save_with_dialog(_safe_filename(fname, "payload.txt"), data, text_mode=True)
-                        except UnicodeDecodeError:
-                            # declared text but not UTF-8 -> save as binary
-                            self._save_with_dialog("payload.bin", data, text_mode=False)
-                    else:
-                        # binary -> save with original filename if any
-                        self._save_with_dialog(_safe_filename(fname, "payload.bin"), data, text_mode=False)
-
+                    dlg = AudioDecodePreview(
+                        self,
+                        stego_path=self.stego_path,
+                        cover_path=_guess_cover_for(self.stego_path),
+                        payload_bytes=data,
+                        payload_name=fname,
+                        payload_mode=mode
+                    )
+                    dlg.exec()
                 else:
-                    # No envelope (legacy/foreign/wrong key) -> heuristic fallback
-                    if self._looks_like_text(payload_bytes):
-                        text = payload_bytes.decode("utf-8")
-                        self._show_text_preview(text, len(payload_bytes))
-                        if QMessageBox.question(
-                            self, "Save text?",
-                            "Display succeeded. Do you also want to save the text to a file?",
-                            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-                        ) == QMessageBox.Yes:
-                            self._save_with_dialog("payload.txt", payload_bytes, text_mode=True)
-                    else:
-                        self._save_with_dialog("payload.bin", payload_bytes, text_mode=False)
+                    # Legacy/foreign MP3Stego: no envelope
+                    mode_guess = 0 if self._looks_like_text(payload_bytes) else 1
+                    fname = "payload.txt" if mode_guess == 0 else "payload.bin"
+                    dlg = AudioDecodePreview(
+                        self,
+                        stego_path=self.stego_path,
+                        cover_path=_guess_cover_for(self.stego_path),
+                        payload_bytes=payload_bytes,
+                        payload_name=fname,
+                        payload_mode=mode_guess
+                    )
+                    dlg.exec()
             except Exception as e:
                 self.error(f"MP3 stego decode failed: {e}")
             return
 
-        # WAV/FLAC route (LSB)
+        # ========== WAV/FLAC/OGG route (LSB) ==========
         token = self.key_token_edit.text().strip()
         if not token:
             self.error("Final Key token is required for WAV/FLAC LSB decode."); return
         try:
             info, kd = self._derive_keys_from_token(token, user_key)
             if info["media_kind"] != "audio": raise ValueError("This token is not for audio")
+
             raw_u8, params = self._read_wav_bytes(self.stego_path)
             lsb = info["lsb"]; roi = info["roi"]; K_perm = kd["K_perm"]; K_bit = kd["K_bit"]; K_check = kd["K_check"]
             tgt_perm = self._rebuild_indices_perm(params, roi, K_perm)
             capacity_bits = len(tgt_perm) * lsb
             if capacity_bits < HEADER_TOTAL_LEN*8: raise ValueError("ROI too small to contain header")
 
+            # header
             header_bits  = self._extract_bits(raw_u8, tgt_perm, HEADER_TOTAL_LEN*8, lsb, K_bit[0])
             header_bytes = self._bits_to_bytes(header_bits); ph = parse_header(header_bytes)
             if ph.kcheck4 != K_check: raise ValueError("Wrong key/token (K_check mismatch)")
             if ph.lsb != lsb or ph.roi != roi: raise ValueError("Token/controls do not match embedded header")
 
-            need_bits_meta_len = 4 * 8
-            total_needed_so_far = HEADER_TOTAL_LEN*8 + need_bits_meta_len
+            # meta length, then meta + payload
+            need_bits_meta_len   = 4 * 8
+            total_needed_so_far  = HEADER_TOTAL_LEN*8 + need_bits_meta_len
             all_bits = self._extract_bits(raw_u8, tgt_perm, total_needed_so_far, lsb, K_bit[0])
             meta_len_bytes = self._bits_to_bytes(all_bits[HEADER_TOTAL_LEN*8 : total_needed_so_far])
             (meta_len,) = struct.unpack("<I", meta_len_bytes)
+
             need_bits_rest = (meta_len + ph.payload_len) * 8
             total_needed   = total_needed_so_far + need_bits_rest
             all_bits = self._extract_bits(raw_u8, tgt_perm, total_needed, lsb, K_bit[0])
 
-            offset = HEADER_TOTAL_LEN*8 + need_bits_meta_len
-            meta_bits = all_bits[offset : offset + meta_len*8]
-            payload_bits = all_bits[offset + meta_len*8 : offset + meta_len*8 + ph.payload_len*8]
+            offset      = HEADER_TOTAL_LEN*8 + need_bits_meta_len
+            meta_bits   = all_bits[offset : offset + meta_len*8]
+            payload_bits= all_bits[offset + meta_len*8 : offset + meta_len*8 + ph.payload_len*8]
 
-            meta = parse_meta(self._bits_to_bytes(meta_bits))
+            meta          = parse_meta(self._bits_to_bytes(meta_bits))
             payload_bytes = self._bits_to_bytes(payload_bits)
 
-            mode = meta.get("mode", 0); fname = meta.get("filename") or ("payload.txt" if mode == 0 else "payload.bin")
-            fname = _safe_filename(fname, "payload.bin"); out_path = SAFE_OUTDIR / fname
+            mode  = int(meta.get("mode", 0))
+            fname = meta.get("filename") or ("payload.txt" if mode == 0 else "payload.bin")
 
-            if mode == 0:
-                try:
-                    text = payload_bytes.decode("utf-8")
-                    out_path.write_text(text, encoding="utf-8")
-                    self.log(f"Decoded text payload ({len(payload_bytes)} bytes) -> {out_path}")
-                    QMessageBox.information(self, "Decode", f"Text payload saved to:\n{out_path}")
-                except UnicodeDecodeError:
-                    out_path.write_bytes(payload_bytes)
-                    self.log(f"Text (non-UTF8) saved as binary -> {out_path}")
-                    QMessageBox.information(self, "Decode", f"Binary saved to:\n{out_path}")
-            else:
-                out_path.write_bytes(payload_bytes)
-                self.log(f"Binary payload saved -> {out_path} ({len(payload_bytes)} bytes)")
-                QMessageBox.information(self, "Decode", f"Binary payload saved to:\n{out_path}")
+            # Show preview dialog (user can save from there)
+            dlg = AudioDecodePreview(
+                self,
+                stego_path=self.stego_path,
+                cover_path=None,  # unknown; user can load via the dialog button
+                payload_bytes=payload_bytes,
+                payload_name=fname,
+                payload_mode=mode
+            )
+            dlg.exec()
         except Exception as e:
             self.error(str(e))
-
 
     def log(self, msg: str):
         self.log_edit.append(msg)
@@ -1303,6 +1308,238 @@ class AudioDecodeTab(QWidget):
     def error(self, msg: str):
         QMessageBox.critical(self, "Error", msg)
         self.log(f"[ERROR] {msg}")
+
+
+class AudioDecodePreview(QtWidgets.QDialog):
+    """
+    Stego (left) vs Cover (right) waveforms, linked zoom/pan.
+    Payload preview at the bottom: shows text or binary summary + Save.
+    """
+    def __init__(self, parent=None, stego_path:str|Path=None, cover_path:str|Path|None=None,
+                 payload_bytes:bytes|None=None, payload_name:str|None=None, payload_mode:int=1):
+        super().__init__(parent)
+        self.setWindowTitle("Decode Preview")
+        self.resize(1100, 700)
+
+        self.stego_path = str(stego_path) if stego_path else None
+        self.cover_path = str(cover_path) if cover_path else None
+        self.payload_bytes = payload_bytes or b""
+        self.payload_mode = int(payload_mode)  # 0=text, 1=binary
+        self.payload_name = payload_name or ("payload.txt" if self.payload_mode == 0 else "payload.bin")
+
+        main = QVBoxLayout(self)
+
+        # --- Top: two waveforms
+        top = QSplitter(Qt.Horizontal)
+        self._left = self._build_wave_panel("Stego")
+        self._right = self._build_wave_panel("Cover")
+        top.addWidget(self._left["box"])
+        top.addWidget(self._right["box"])
+        top.setSizes([550, 550])
+        main.addWidget(top, 2)
+
+        # toolbar row (fit/zoom and spectrogram toggle)
+        tools = QHBoxLayout()
+        self.btn_fit = QPushButton("Fit")
+        self.btn_fit.clicked.connect(self._fit_both)
+        self.btn_zoom_in = QPushButton("+")
+        self.btn_zoom_out = QPushButton("–")
+        self.btn_zoom_in.clicked.connect(lambda: self._zoom(0.8))
+        self.btn_zoom_out.clicked.connect(lambda: self._zoom(1.25))
+        self.chk_link = QtWidgets.QCheckBox("Link zoom/pan"); self.chk_link.setChecked(True)
+        self.chk_spec = QtWidgets.QCheckBox("Spectrogram"); self.chk_spec.setChecked(False)
+        self.chk_spec.stateChanged.connect(self._replot_both)
+        tools.addWidget(self.btn_fit); tools.addWidget(self.btn_zoom_in); tools.addWidget(self.btn_zoom_out)
+        tools.addSpacing(12); tools.addWidget(self.chk_link); tools.addSpacing(12); tools.addWidget(self.chk_spec)
+        tools.addStretch(1)
+
+        # Optional: button to load a cover file if none supplied
+        self.btn_load_cover = QPushButton("Load cover for compare…")
+        self.btn_load_cover.clicked.connect(self._choose_cover)
+        tools.addWidget(self.btn_load_cover)
+        main.addLayout(tools)
+
+        # --- Bottom: payload preview
+        payload_box = QGroupBox("Payload")
+        pv = QVBoxLayout(payload_box)
+
+        self.lbl_meta = QLabel("")
+        pv.addWidget(self.lbl_meta)
+
+        self.text_view = QTextEdit(); self.text_view.setReadOnly(True); self.text_view.hide()
+        pv.addWidget(self.text_view, 1)
+
+        row_btns = QHBoxLayout()
+        self.btn_save_payload = QPushButton("Save payload…")
+        self.btn_open_folder = QPushButton("Open payload folder")
+        self.btn_save_payload.clicked.connect(self._save_payload_dialog)
+        self.btn_open_folder.clicked.connect(lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(SAFE_OUTDIR))))
+        row_btns.addStretch(1); row_btns.addWidget(self.btn_save_payload); row_btns.addWidget(self.btn_open_folder)
+        pv.addLayout(row_btns)
+
+        main.addWidget(payload_box, 1)
+
+        # Load the audio now
+        self._load_audio()
+        self._populate_payload()
+
+    # ---------- UI builders ----------
+    def _build_wave_panel(self, title: str):
+        box = QGroupBox(title)
+        v = QVBoxLayout(box)
+        fig = Figure(figsize=(5, 2.5), facecolor="white")
+        canvas = FigureCanvasQTAgg(fig)
+        ax = fig.add_subplot(111)
+        ax.set_facecolor("#f9fbff")
+        for s in ("top", "right"): ax.spines[s].set_visible(False)
+        ax.set_xlabel("Time (s)"); ax.set_ylabel("Amplitude")
+        v.addWidget(canvas)
+
+        # status under plot
+        status = QLabel(" — ")
+        v.addWidget(status)
+
+        # link pan/zoom
+        def on_xlims(ax_):
+            if not self.chk_link.isChecked():
+                return
+            other = self._right if ax_ is self._left["ax"] else self._left
+            try:
+                other["ax"].set_xlim(ax_.get_xlim())
+                other["canvas"].draw_idle()
+            except Exception:
+                pass
+
+        # Matplotlib callbacks
+        def _on_xlims_changed(ax_):
+            on_xlims(ax_)
+
+        ax.callbacks.connect("xlim_changed", _on_xlims_changed)
+
+        return {"box": box, "fig": fig, "canvas": canvas, "ax": ax, "status": status, "data": None}
+
+    # ---------- Audio & plotting ----------
+    def _pcm_from_path(self, path:str) -> tuple[np.ndarray,int]:
+        pcm = decode_any_to_pcm(path, force_mono=True)
+        mono = pcm.samples_i16 if pcm.samples_i16.ndim == 1 else pcm.samples_i16[:,0]
+        return mono.astype(np.int32), int(pcm.rate)
+
+    def _plot_wave(self, panel, samples: np.ndarray, rate: int, title: str):
+        ax = panel["ax"]; ax.cla()
+        ax.set_facecolor("#f9fbff"); ax.grid(True, alpha=0.25)
+        for s in ("top","right"): ax.spines[s].set_visible(False)
+        ax.set_xlabel("Time (s)"); ax.set_ylabel("Amplitude")
+        if self.chk_spec.isChecked():
+            # quick&clean spectrogram
+            from matplotlib.colors import LogNorm
+            NFFT = 1024; nover = 768
+            ax.specgram(samples.astype(np.float32)/32768.0, NFFT=NFFT, Fs=rate, noverlap=nover, cmap="magma", scale="dB")
+            ax.set_ylabel("Freq (Hz)")
+        else:
+            n = len(samples); step = max(1, n // 200_000)
+            y = (samples[::step].astype(np.float32))
+            m = float(np.max(np.abs(y))) or 1.0
+            y = y / m
+            x = (np.arange(len(y)) * step) / rate
+            ax.plot(x, y, linewidth=1.0)
+            ax.set_ylim(-1.1, 1.1)
+        ax.set_title(title)
+        panel["canvas"].draw_idle()
+
+    def _load_audio(self):
+        # left: stego
+        if self.stego_path and os.path.isfile(self.stego_path):
+            s, r = self._pcm_from_path(self.stego_path)
+            self._left["data"] = (s, r)
+            self._plot_wave(self._left, s, r, Path(self.stego_path).name)
+            self._left["status"].setText(f"{len(s)/max(1,r):.2f}s @ {r} Hz  |  frames={len(s)}")
+
+        # right: cover (optional)
+        if self.cover_path and os.path.isfile(self.cover_path):
+            c, rc = self._pcm_from_path(self.cover_path)
+            self._right["data"] = (c, rc)
+            self._plot_wave(self._right, c, rc, Path(self.cover_path).name)
+            self._right["status"].setText(f"{len(c)/max(1,rc):.2f}s @ {rc} Hz  |  frames={len(c)}")
+
+            # diff metrics (only if both exist and same rate)
+            if self._left["data"] and self._right["data"] and (self._left["data"][1] == rc):
+                s = self._left["data"][0]; n = min(len(s), len(c))
+                if n > 0:
+                    d = (s[:n].astype(np.int32) - c[:n].astype(np.int32))
+                    mx = int(np.max(np.abs(d)))
+                    mse = float(np.mean((d.astype(np.float64))**2))
+                    snr = 10.0 * math.log10((np.mean((c[:n].astype(np.float64))**2)+1e-12) / (mse+1e-12))
+                    self._left["status"].setText(self._left["status"].text() + f"    |    maxΔ={mx}  SNR≈{snr:.2f} dB")
+
+    def _replot_both(self):
+        if self._left["data"]:
+            s, r = self._left["data"]; self._plot_wave(self._left, s, r, Path(self.stego_path).name)
+        if self._right["data"]:
+            c, rc = self._right["data"]; self._plot_wave(self._right, c, rc, Path(self.cover_path).name)
+
+    def _fit_both(self):
+        for p in (self._left, self._right):
+            try:
+                ax = p["ax"]
+                x0, x1 = 0.0, ax.lines[0].get_xdata()[-1] if ax.lines else ax.get_xlim()[1]
+                ax.set_xlim(x0, x1)
+                p["canvas"].draw_idle()
+            except Exception:
+                pass
+
+    def _zoom(self, factor: float):
+        for p in (self._left, self._right):
+            try:
+                ax = p["ax"]; x0, x1 = ax.get_xlim()
+                cx = 0.5*(x0+x1); hw = 0.5*(x1-x0)*factor
+                ax.set_xlim(max(0.0, cx-hw), max(cx+hw, 1e-3))
+                p["canvas"].draw_idle()
+            except Exception:
+                pass
+
+    def _choose_cover(self):
+        dlg = QFileDialog(self); dlg.setFileMode(QFileDialog.ExistingFile)
+        dlg.setNameFilter("Audio files (*.wav *.mp3 *.flac *.ogg)")
+        if dlg.exec():
+            f = dlg.selectedFiles()[0]
+            self.cover_path = f
+            self._right["data"] = None
+            self._load_audio()
+
+    # ---------- Payload preview ----------
+    def _looks_like_text(self, b: bytes) -> bool:
+        try:
+            s = b.decode("utf-8"); 
+        except UnicodeDecodeError:
+            return False
+        printable = sum(ch.isprintable() or ch in "\r\n\t" for ch in s)
+        return printable / max(1, len(s)) > 0.95
+
+    def _populate_payload(self):
+        n = len(self.payload_bytes)
+        if self.payload_mode == 0 and self._looks_like_text(self.payload_bytes):
+            self.text_view.setPlainText(self.payload_bytes.decode("utf-8"))
+            self.text_view.show()
+            self.lbl_meta.setText(f"{self.payload_name}  •  {n} bytes  •  UTF-8 text")
+        else:
+            self.text_view.hide()
+            self.lbl_meta.setText(f"{self.payload_name}  •  {n} bytes  •  binary")
+
+    def _save_payload_dialog(self):
+        suggested = _safe_filename(self.payload_name, "payload.bin" if self.payload_mode else "payload.txt")
+        path, _ = QFileDialog.getSaveFileName(self, "Save payload as…", str(SAFE_OUTDIR / suggested), "All files (*)")
+        if not path:
+            return
+        try:
+            # If it is text, save as UTF-8
+            if self.payload_mode == 0 and self._looks_like_text(self.payload_bytes):
+                Path(path).write_text(self.payload_bytes.decode("utf-8"), encoding="utf-8")
+            else:
+                Path(path).write_bytes(self.payload_bytes)
+            QMessageBox.information(self, "Saved", f"Saved to:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save payload: {e}")
+
 
 # -------------------------------
 # Suite
