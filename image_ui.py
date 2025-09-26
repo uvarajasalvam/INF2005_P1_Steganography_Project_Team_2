@@ -235,14 +235,15 @@ def get_source_dir() -> Path:
     If not found, we create one next to this file.
     """
     here = Path(__file__).resolve()
-    # Search current dir and parents for an existing 'source'
+    # Search for an existing 'source' folder
     for p in [here.parent, *here.parents]:
         cand = p / "source"
         if cand.is_dir():
-            cand.mkdir(parents=True, exist_ok=True)
-            return cand
-    # Fallback: create 'source' next to this file
-    fallback = here.parent / "source"
+            outdir = p / "output"
+            outdir.mkdir(parents=True, exist_ok=True)
+            return outdir
+    # Fallback: create 'output' next to this file
+    fallback = here.parent / "output"
     fallback.mkdir(parents=True, exist_ok=True)
     return fallback
 
