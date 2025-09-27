@@ -5,17 +5,19 @@ import sys
 
 from image_ui import ImageSuite
 from audio_ui import AudioSuite
+from video_ui import VideoSuite
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Stego Studio (Image & Audio)")
+        self.setWindowTitle("Stego Studio (Image, Audio & Video)")
         self.resize(1220, 800)
 
         self.top_tabs = QTabWidget()
         self.top_tabs.addTab(ImageSuite(), "Image")
         self.top_tabs.addTab(AudioSuite(), "Audio")
+        self.top_tabs.addTab(VideoSuite(), "Video")
         self.setCentralWidget(self.top_tabs)
 
         self._build_menu()
