@@ -26,8 +26,24 @@ import sys, re
 print("FFmpeg =", which_ffmpeg("ffmpeg"))
 
 # ----------------- constants / utils -----------------
-SAFE_OUTDIR = Path.cwd() / "output"
-SAFE_OUTDIR.mkdir(exist_ok=True)
+def get_source_dir() -> Path:
+    """
+    Return the project's 'output' directory, mirroring the image tool:
+    - Search upward from this file for a folder named 'source'.
+      If found, create/use a sibling 'output' next to it.
+    - Otherwise, create/use 'output' next to this file.
+    """
+    here = Path(__file__).resolve()
+    for p in [here.parent, *here.parents]:
+        if (p / "source").is_dir():
+            outdir = p / "output"
+            outdir.mkdir(parents=True, exist_ok=True)
+            return outdir
+    fallback = here.parent / "output"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+OUTDIR = get_source_dir()
 
 def _safe_filename(name: str, fallback: str = "payload.bin") -> str:
     cand = (name or fallback).replace("\\", "_").replace("/", "_").strip()
@@ -211,6 +227,66 @@ def parse_key_token(token: str) -> dict:
     if magic != b"KEY1": raise ValueError("Bad token magic")
     media_kind = "image" if media_code == 0 else "audio"
     return {"media_kind": media_kind, "lsb": lsb, "roi": (x0,y0,w,h), "salt16": salt16, "kcheck4": kcheck4}
+
+# ---------- sidecar .meta ----------
+def write_sidecar_meta(
+    stego_path: Path,
+    *,
+    cover_path: str | None,
+    method: str,                         # "wav_lsb" | "mp3stego"
+    rate: int | None = None,
+    channels: int | None = None,
+    lsb: int | None = None,
+    roi: tuple[int,int,int,int] | None = None,  # (start,0,length,0) for audio
+    token: str | None = None,            # LSB token (stg1:...)
+    payload_name: str | None = None,
+    payload_mode: int | None = None      # 0=text,1=binary
+) -> None:
+    lines: list[str] = []
+    # 1st line = absolute cover path (or blank)
+    lines.append(str(Path(cover_path).resolve()) if cover_path else "")
+    lines.append(f"method={method}")
+    if rate      is not None: lines.append(f"rate={rate}")
+    if channels  is not None: lines.append(f"channels={channels}")
+    if lsb       is not None: lines.append(f"lsb={lsb}")
+    if roi       is not None:
+        x0,y0,w,h = roi
+        lines.append(f"roi={x0},{y0},{w},{h}")
+    if token:                lines.append(f"token={token}")
+    if payload_name:         lines.append(f"payload_name={payload_name}")
+    if payload_mode is not None: lines.append(f"payload_mode={int(payload_mode)}")
+    (stego_path.with_suffix(".meta")).write_text("\n".join(lines), encoding="utf-8")
+
+def read_sidecar_meta(stego_path: Path) -> dict | None:
+    meta = stego_path.with_suffix(".meta")
+    if not meta.exists():
+        # also check OUTDIR for convenience
+        alt = OUTDIR / meta.name
+        if not alt.exists():
+            return None
+        meta = alt
+    try:
+        lines = meta.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return None
+    d: dict = {}
+    d["cover_path"] = (lines[0].strip() or None) if lines else None
+    for ln in lines[1:]:
+        if "=" not in ln: continue
+        k, v = ln.split("=", 1)
+        d[k.strip()] = v.strip()
+    # normalize parsed types
+    if "roi" in d:
+        try:
+            x0,y0,w,h = [int(x) for x in d["roi"].split(",")]
+            d["roi"] = (x0,y0,w,h)
+        except Exception:
+            d.pop("roi", None)
+    for k in ("rate","channels","lsb","payload_mode"):
+        if k in d:
+            try: d[k] = int(d[k])
+            except Exception: d.pop(k, None)
+    return d
 
 # ----------------- waveform widget -----------------
 class WaveformView(QWidget):
@@ -912,7 +988,7 @@ class AudioEncodeTab(QWidget):
 
     def _export_mp3_preview_from_wav(self, wav_path: str, suggested_name_stem: str) -> str:
         """Produce a non-decodable MP3 from a stego WAV (for A/B listening)."""
-        out_mp3 = SAFE_OUTDIR / f"{suggested_name_stem}_stego_preview.mp3"
+        out_mp3 = OUTDIR / f"{suggested_name_stem}_stego_preview.mp3"
         a = AudioSegment.from_wav(wav_path)
         a.export(out_mp3, format="mp3")  # uses system ffmpeg
         return str(out_mp3)
@@ -934,7 +1010,7 @@ class AudioEncodeTab(QWidget):
             # --- MP3 path (robust, decodable) ---
             try:
                 wav_for_mp3stego = self._prep_wav_for_mp3stego()
-                out_mp3 = SAFE_OUTDIR / f"{Path(self.orig_cover_path).stem}_stego.mp3"
+                out_mp3 = OUTDIR / f"{Path(self.orig_cover_path).stem}_stego.mp3"
 
                 # Wrap so we can recover filename/type and exact length later
                 mode = 0 if self.payload_panel.mode() == "text" else 1
@@ -945,6 +1021,22 @@ class AudioEncodeTab(QWidget):
                 MP3STEGO.embed(wav_for_mp3stego, payload_wrapped, key, str(out_mp3))
                 self.key_token_edit.setText("(mp3stego)")  # MP3Stego uses the passphrase only
                 self.log(f"[MP3Stego] Saved stego MP3: {out_mp3}")
+
+                # NEW: sidecar meta
+                try:
+                    write_sidecar_meta(
+                        stego_path=out_mp3,
+                        cover_path=self.orig_cover_path,
+                        method="mp3stego",
+                        rate=None, channels=None, lsb=None, roi=None,
+                        token=None,  # MP3Stego does not use our token
+                        payload_name=fname,
+                        payload_mode=mode
+                    )
+                    self.log(f"[MP3Stego] Wrote meta: {out_mp3.with_suffix('.meta')}")
+                except Exception as _e:
+                    self.log(f"[WARN] Could not write meta: {_e}")
+
                 QMessageBox.information(self, "Encode complete", f"Stego MP3 written:\n{out_mp3}")
             except Exception as e:
                 self.error(f"MP3 stego failed: {e}")
@@ -984,7 +1076,7 @@ class AudioEncodeTab(QWidget):
             self.wave.highlight_impacts(impacted_frames, params["rate"])
             self._embed_bits_into_bytes(raw_u8, tgt_perm, bit_groups, lsb, kbit_byte)
 
-            out_wav = SAFE_OUTDIR / f"{Path(self.orig_cover_path).stem}_stego.wav"
+            out_wav = OUTDIR / f"{Path(self.orig_cover_path).stem}_stego.wav"
             if getattr(self, "pcm_meta", None) and self.pcm_meta.is_lossy:
                 self.log("[NOTE] Stego written as WAV because LSB requires lossless PCM. "
                         "Do NOT convert this stego.wav to MP3 if you intend to decode later.")
@@ -1003,6 +1095,24 @@ class AudioEncodeTab(QWidget):
             self.log(f"Embedded {total_bits} bits into {len(tgt)} target bytes @ {lsb} LSB(s).")
             self.log(f"Saved stego audio: {out_wav}")
 
+            # NEW: sidecar meta
+            try:
+                write_sidecar_meta(
+                    stego_path=out_wav,
+                    cover_path=self.orig_cover_path,
+                    method="wav_lsb",
+                    rate=params["rate"],
+                    channels=params["channels"],
+                    lsb=lsb,
+                    roi=roi,
+                    token=token,
+                    payload_name=fname,
+                    payload_mode=mode
+                )
+                self.log(f"[LSB] Wrote meta: {out_wav.with_suffix('.meta')}")
+            except Exception as _e:
+                self.log(f"[WARN] Could not write meta: {_e}")
+
             # Optional preview MP3 for A/B if original was MP3 but user chose LSB
             if getattr(self, "is_mp3_cover", False) and not self.chk_use_mp3stego.isChecked():
                 preview_mp3 = self._export_mp3_preview_from_wav(str(out_wav), Path(self.orig_cover_path).stem)
@@ -1017,6 +1127,7 @@ class AudioEncodeTab(QWidget):
         except Exception as e:
             self.error(str(e))
 
+
     def log(self, msg: str): self.log_edit.append(msg)
     def error(self, msg: str): QMessageBox.critical(self, "Error", msg); self.log(f"[ERROR] {msg}")
 
@@ -1025,6 +1136,7 @@ class AudioDecodeTab(QWidget):
     def __init__(self):
         super().__init__()
         self.stego_path: str | None = None
+        self._meta: dict | None = None
         root = QVBoxLayout(self)
         media_box = QGroupBox("Stego Audio (WAV/FLAC/OGG or MP3+ID3)")
         mv = QVBoxLayout()
@@ -1102,8 +1214,27 @@ class AudioDecodeTab(QWidget):
             else:
                 self.media_info.setText(f"Path: {path}")
             self.log(f"Loaded stego file: {path}")
+
+            # NEW: load sidecar meta and prefill UI
+            self._meta = read_sidecar_meta(Path(path))
+            if self._meta:
+                cover_line = f"\nCover (from .meta): {self._meta.get('cover_path')}" if self._meta.get("cover_path") else ""
+                det = []
+                if self._meta.get("method"):   det.append(f"method={self._meta['method']}")
+                if self._meta.get("lsb") is not None: det.append(f"lsb={self._meta['lsb']}")
+                if self._meta.get("roi"):      det.append(f"roi={self._meta['roi']}")
+                if self._meta.get("rate"):     det.append(f"rate={self._meta['rate']}")
+                if self._meta.get("channels"): det.append(f"channels={self._meta['channels']}")
+                if det:
+                    self.media_info.setText(self.media_info.text() + cover_line + "\nMeta: " + ", ".join(det))
+                if self._meta.get("token") and not self.key_token_edit.text().strip():
+                    self.key_token_edit.setText(self._meta["token"])
+                self.log(f"[Meta] Loaded: {Path(path).with_suffix('.meta').name}")
+            else:
+                self.log("[Meta] No sidecar found.")
         except Exception as e:
             self.error(str(e))
+
 
     def _extract_bits(self, raw_u8, tgt_indices, total_bits_needed, lsb, kbit_byte):
         bits_out = []; rotate = kbit_byte % lsb if lsb > 0 else 0
@@ -1155,7 +1286,7 @@ class AudioDecodeTab(QWidget):
     def _save_with_dialog(self, suggested_name: str, data: bytes, text_mode: bool = False) -> None:
         suggested_name = _safe_filename(suggested_name, "payload.bin")
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save payload as…", str(SAFE_OUTDIR / suggested_name), "All files (*)"
+            self, "Save payload as…", str(OUTDIR / suggested_name), "All files (*)"
         )
         if not path:
             self.log("[Decode] Save cancelled by user.")
@@ -1197,17 +1328,34 @@ class AudioDecodeTab(QWidget):
         if not user_key:
             self.error("Enter the key/passphrase."); return
 
-        # --- helper: try to guess a cover sibling (optional) ---
+        # ---------- helpers ----------
         def _guess_cover_for(stego_path: str) -> str | None:
             p = Path(stego_path)
-            # common pattern we created on encode: *_stego.*  -> try to find original stem
-            stem = p.stem
-            base = stem.replace("_stego", "")
+            base = p.stem.replace("_stego", "")
             for sx in (".wav", ".flac", ".ogg", ".mp3"):
                 cand = p.with_name(base + sx)
                 if cand.is_file() and str(cand) != stego_path:
                     return str(cand)
             return None
+
+        def _auto_save_binary(suggested_name: str, data: bytes) -> Path:
+            name = _safe_filename(suggested_name or "payload.bin", "payload.bin")
+            out = OUTDIR / name
+            # avoid overwriting: add -1, -2, ...
+            if out.exists():
+                stem, suf = out.stem, out.suffix
+                i = 1
+                while True:
+                    cand = OUTDIR / f"{stem}-{i}{suf}"
+                    if not cand.exists():
+                        out = cand; break
+                    i += 1
+            out.write_bytes(data)
+            self.log(f"[Decode] Saved binary payload -> {out} ({len(data)} bytes)")
+            return out
+
+        # Prefer meta cover if available
+        meta_cover = (self._meta.get("cover_path") if (getattr(self, "_meta", None) and self._meta.get("cover_path")) else None)
 
         # ========== MP3 route (MP3Stego) ==========
         if ext == ".mp3":
@@ -1215,33 +1363,41 @@ class AudioDecodeTab(QWidget):
                 payload_bytes = MP3STEGO.extract(self.stego_path, user_key)
                 self.log(f"[MP3Stego] Extracted {len(payload_bytes)} bytes; head={payload_bytes[:16].hex()}")
 
-                # Prefer our envelope (supports binary + filename)
                 unwrapped = mp3_unwrap_payload(payload_bytes)
                 if unwrapped is not None:
                     meta, data = unwrapped
                     mode = int(meta.get("mode", 0))   # 0=text, 1=binary
                     fname = meta.get("filename") or ("payload.txt" if mode == 0 else "payload.bin")
 
+                    if mode == 0 and self._looks_like_text(data):
+                        # TEXT → log only
+                        self._show_text_preview(data.decode("utf-8"), len(data))
+                        return
+
+                    # BINARY → auto-save then (optionally) preview
+                    saved = _auto_save_binary(fname, data)
                     dlg = AudioDecodePreview(
                         self,
                         stego_path=self.stego_path,
-                        cover_path=_guess_cover_for(self.stego_path),
+                        cover_path=(meta_cover or _guess_cover_for(self.stego_path)),
                         payload_bytes=data,
-                        payload_name=fname,
-                        payload_mode=mode
+                        payload_name=saved.name,
+                        payload_mode=1
                     )
                     dlg.exec()
                 else:
-                    # Legacy/foreign MP3Stego: no envelope
-                    mode_guess = 0 if self._looks_like_text(payload_bytes) else 1
-                    fname = "payload.txt" if mode_guess == 0 else "payload.bin"
+                    # Legacy MP3Stego (no envelope)
+                    if self._looks_like_text(payload_bytes):
+                        self._show_text_preview(payload_bytes.decode("utf-8"), len(payload_bytes))
+                        return
+                    saved = _auto_save_binary("payload.bin", payload_bytes)
                     dlg = AudioDecodePreview(
                         self,
                         stego_path=self.stego_path,
-                        cover_path=_guess_cover_for(self.stego_path),
+                        cover_path=(meta_cover or _guess_cover_for(self.stego_path)),
                         payload_bytes=payload_bytes,
-                        payload_name=fname,
-                        payload_mode=mode_guess
+                        payload_name=saved.name,
+                        payload_mode=1
                     )
                     dlg.exec()
             except Exception as e:
@@ -1289,14 +1445,20 @@ class AudioDecodeTab(QWidget):
             mode  = int(meta.get("mode", 0))
             fname = meta.get("filename") or ("payload.txt" if mode == 0 else "payload.bin")
 
-            # Show preview dialog (user can save from there)
+            if mode == 0 and self._looks_like_text(payload_bytes):
+                # TEXT → log only
+                self._show_text_preview(payload_bytes.decode("utf-8"), len(payload_bytes))
+                return
+
+            # BINARY → auto-save then (optionally) preview
+            saved = _auto_save_binary(fname, payload_bytes)
             dlg = AudioDecodePreview(
                 self,
                 stego_path=self.stego_path,
-                cover_path=None,  # unknown; user can load via the dialog button
+                cover_path=meta_cover,  # prefer .meta
                 payload_bytes=payload_bytes,
-                payload_name=fname,
-                payload_mode=mode
+                payload_name=saved.name,
+                payload_mode=1
             )
             dlg.exec()
         except Exception as e:
@@ -1373,7 +1535,7 @@ class AudioDecodePreview(QtWidgets.QDialog):
         self.btn_save_payload = QPushButton("Save payload…")
         self.btn_open_folder = QPushButton("Open payload folder")
         self.btn_save_payload.clicked.connect(self._save_payload_dialog)
-        self.btn_open_folder.clicked.connect(lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(SAFE_OUTDIR))))
+        self.btn_open_folder.clicked.connect(lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(OUTDIR))))
         row_btns.addStretch(1); row_btns.addWidget(self.btn_save_payload); row_btns.addWidget(self.btn_open_folder)
         pv.addLayout(row_btns)
 
@@ -1527,7 +1689,7 @@ class AudioDecodePreview(QtWidgets.QDialog):
 
     def _save_payload_dialog(self):
         suggested = _safe_filename(self.payload_name, "payload.bin" if self.payload_mode else "payload.txt")
-        path, _ = QFileDialog.getSaveFileName(self, "Save payload as…", str(SAFE_OUTDIR / suggested), "All files (*)")
+        path, _ = QFileDialog.getSaveFileName(self, "Save payload as…", str(OUTDIR / suggested), "All files (*)")
         if not path:
             return
         try:
@@ -1535,10 +1697,11 @@ class AudioDecodePreview(QtWidgets.QDialog):
             if self.payload_mode == 0 and self._looks_like_text(self.payload_bytes):
                 Path(path).write_text(self.payload_bytes.decode("utf-8"), encoding="utf-8")
             else:
-                Path(path).write_bytes(self.payload_bytes)
+                Path(path).write_bytes(self.payload_bytes) 
             QMessageBox.information(self, "Saved", f"Saved to:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save payload: {e}")
+
 
 
 # -------------------------------
