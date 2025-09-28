@@ -337,6 +337,85 @@ def extract_header_from_frame(img_rgb: np.ndarray, need_bytes: int, lsb: int, ro
         out.append(b)
     return bytes(out)
 
+# ---------- sidecar .meta (video) ----------
+def write_sidecar_meta(
+    stego_path: Path,
+    *,
+    cover_path: str | None,
+    method: str,                         # "video_lsb"
+    fps: float | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    lsb: int | None = None,
+    roi: tuple[int,int,int,int] | None = None,      # x,y,w,h
+    frames: tuple[int,int,int] | None = None,       # (start,len,step)
+    token: str | None = None,
+    payload_name: str | None = None,
+    payload_mode: int | None = None                 # 0=text,1=file
+) -> None:
+    lines: list[str] = []
+    # 1st line = absolute cover path (or blank)
+    lines.append(str(Path(cover_path).resolve()) if cover_path else "")
+    lines.append(f"method={method}")
+    if fps      is not None: lines.append(f"fps={fps:.6f}")
+    if width    is not None: lines.append(f"width={int(width)}")
+    if height   is not None: lines.append(f"height={int(height)}")
+    if lsb      is not None: lines.append(f"lsb={int(lsb)}")
+    if roi      is not None:
+        x,y,w,h = roi
+        lines.append(f"roi={x},{y},{w},{h}")
+    if frames   is not None:
+        s,l,st = frames
+        lines.append(f"frames={s},{l},{st}")
+    if token:                 lines.append(f"token={token}")
+    if payload_name:          lines.append(f"payload_name={payload_name}")
+    if payload_mode is not None:
+        lines.append(f"payload_mode={int(payload_mode)}")
+    (Path(stego_path).with_suffix(".meta")).write_text("\n".join(lines), encoding="utf-8")
+
+def read_sidecar_meta(stego_path: Path) -> dict | None:
+    meta = Path(stego_path).with_suffix(".meta")
+    if not meta.exists():
+        alt = OUTPUT_DIR / meta.name
+        if not alt.exists():
+            return None
+        meta = alt
+    try:
+        lines = meta.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return None
+    if not lines:
+        return None
+    d: dict = {}
+    d["cover_path"] = (lines[0].strip() or None)
+    for ln in lines[1:]:
+        if "=" not in ln:
+            continue
+        k, v = ln.split("=", 1)
+        d[k.strip()] = v.strip()
+
+    # normalize
+    if "roi" in d:
+        try:
+            x,y,w,h = [int(x) for x in d["roi"].split(",")]
+            d["roi"] = (x,y,w,h)
+        except Exception:
+            d.pop("roi", None)
+    if "frames" in d:
+        try:
+            s,l,st = [int(x) for x in d["frames"].split(",")]
+            d["frames"] = (s,l,st)
+        except Exception:
+            d.pop("frames", None)
+    for k in ("width","height","lsb","payload_mode"):
+        if k in d:
+            try: d[k] = int(d[k])
+            except Exception: d.pop(k, None)
+    if "fps" in d:
+        try: d["fps"] = float(d["fps"])
+        except Exception: d.pop("fps", None)
+    return d
+
 # -----------------------------------------------------------------------------#
 # Video I/O
 class VideoReader:
@@ -358,25 +437,19 @@ class VideoReader:
         except: pass
 
 def open_writer_like(reader: VideoReader, out_stem: str):
-    """
-    Always use PNG sequence + ffmpeg FFV1 (rgb24) so LSBs survive exactly.
-    Returns a writer-like object with .write(bgr_frame) and .release().
-    codec_name = "FFMPEG_FFV1_SEQ"
-    """
     out_path = OUTPUT_DIR / f"{Path(out_stem).name}_stego.mkv"
 
     class _PngSeqWriter:
-        def __init__(self, out_path: Path, fps: float, wh: tuple[int,int]):
+        def __init__(self, out_path: Path, fps: float, wh: tuple[int,int], src_path: str):
             self.out_path = out_path
+            self.src_path = src_path            # <— keep original file path
             self.fps = fps or 25.0
             self.wh = wh
             self.tmpdir = Path(tempfile.mkdtemp(prefix="stego_png_"))
             self.count = 0
 
         def write(self, bgr_frame):
-            # Save exact 8-bit PNG (no compression side-effects on pixel values)
             fn = self.tmpdir / f"frame_{self.count:06d}.png"
-            # IMPORTANT: bgr_frame is already BGR; cv2.imwrite expects BGR.
             cv2.imwrite(str(fn), bgr_frame, [cv2.IMWRITE_PNG_COMPRESSION, 0])
             self.count += 1
 
@@ -384,21 +457,26 @@ def open_writer_like(reader: VideoReader, out_stem: str):
             if self.count == 0:
                 shutil.rmtree(self.tmpdir, ignore_errors=True)
                 return
-            # Mux to FFV1, forcing RGB24 so no colorspace conversion happens
+
+            # Build video from PNGs and copy audio from original (if any)
             cmd = [
                 "ffmpeg", "-y",
                 "-framerate", f"{self.fps}",
                 "-i", str(self.tmpdir / "frame_%06d.png"),
+                "-i", self.src_path,                 # audio source
+                "-map", "0:v:0",                     # take video from PNG sequence
+                "-map", "1:a?",                      # take audio (if present) from original
                 "-c:v", "ffv1", "-pix_fmt", "rgb24",
+                "-c:a", "copy",                      # copy audio without re-encoding
+                "-shortest",                         # end at the shortest stream
                 str(self.out_path)
             ]
             proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            # Cleanup temp frames
             shutil.rmtree(self.tmpdir, ignore_errors=True)
             if proc.returncode != 0:
                 raise RuntimeError("ffmpeg failed:\n" + proc.stderr.decode("utf-8", errors="ignore"))
 
-    return _PngSeqWriter(out_path, reader.fps, (reader.w, reader.h)), str(out_path), "FFMPEG_FFV1_SEQ"
+    return _PngSeqWriter(out_path, reader.fps, (reader.w, reader.h), reader.path), str(out_path), "FFMPEG_FFV1_SEQ"
 
 # ---------- Lossless/losssy helpers (paste near other helpers) ----------
 def probe_stream(path: str) -> tuple[str, str]:
@@ -440,22 +518,22 @@ def is_safe_for_lsb(codec: str, pix: str) -> bool:
 
 
 def make_view_mp4(from_mkv: str) -> str:
-    """
-    Create a human-viewable H.264 MP4 copy from the lossless stego MKV.
-    NOTE: This is ONLY for watching; decoding from it will break LSBs.
-    """
     out_mp4 = str(Path(from_mkv).with_suffix("")) + "_view.mp4"
     cmd = [
         "ffmpeg", "-y",
         "-i", from_mkv,
+        "-map", "0:v:0", "-map", "0:a?",
         "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
         "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k",
+        "-shortest",
         out_mp4
     ]
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if p.returncode != 0:
         raise RuntimeError("ffmpeg failed while making view MP4:\n" + p.stderr.decode("utf-8", errors="ignore"))
     return out_mp4
+
 
 
 # -----------------------------------------------------------------------------#
@@ -837,7 +915,7 @@ class VideoEncodePage(QWidget):
             raw_payload = self.payload_panel.payload_bytes()
             if not raw_payload: raise ValueError("Enter payload text or choose a payload file.")
 
-            # Envelope (keep your behavior)
+            # Envelope
             is_text = (self.payload_panel.mode() == "text")
             orig_name = None if is_text else (Path(self.payload_panel.payload_path).name if self.payload_panel.payload_path else "payload.bin")
             embed_bytes = make_envelope(is_text, raw_payload, orig_name)
@@ -861,28 +939,22 @@ class VideoEncodePage(QWidget):
             token = make_key_token_video(lsb, roi, start_f, length_f, step, salt16, K_check)
             self.key_token.setText(token)
 
-            # Capacity check (header + payload)
+            # Capacity checks
             frames = len(frames_list)
             safe_cap_bits = safe_payload_capacity_bits(lsb, w, h, frames)
             need_payload_bits = len(embed_bytes) * 8
-
-            # Also reject if header itself can’t fit in one frame’s GREEN channel
             if header_fields_needed(lsb) > (w * h):
                 raise ValueError("ROI too small for header; increase ROI size or LSBs.")
-
             if need_payload_bits > safe_cap_bits:
                 raise ValueError(
                     f"Payload too large for this ROI/LSB/frame window after reserving header.\n"
                     f"Need {need_payload_bits} bits, have {safe_cap_bits} bits."
                 )
 
-            # ---- Reserve header fields on first frame (GREEN channel) ----
+            # Reserve header area on first frame (GREEN)
             header_bits_needed = len(header) * 8
-            header_fields = (header_bits_needed + lsb - 1) // lsb  # how many lsb-fields we use
-            reserved = set()  # tuples of (frame_idx, y, x, chan)
-
-            # We write the header sequentially across ROI, GREEN channel, MSB→LSB
-            # Reserve exactly the same first 'header_fields' positions we will touch.
+            header_fields = (header_bits_needed + lsb - 1) // lsb
+            reserved = set()
             chan_green = 1
             taken = 0
             for yy in range(y0, y0 + h):
@@ -892,50 +964,35 @@ class VideoEncodePage(QWidget):
                     reserved.add((start_f, yy, xx, chan_green))
                     taken += 1
 
-            # ---- Plan PRP positions for PAYLOAD ONLY, skipping the reserved header area ----
+            # PRP for payload skipping reserved
             N = frames * w * h * 3
             start_idx, step_perm = prp_params_from_Kperm(K_perm, N)
             payload_fields = (len(embed_bytes) * 8 + lsb - 1) // lsb
-
             def prp_coord_at(i: int) -> tuple[int,int,int,int]:
                 idx = (start_idx + i * step_perm) % N
                 return index_to_coord(idx, roi, frames_list)
-
             chosen_positions: Dict[int, List[Tuple[int,int,int]]] = {}
-            i = 0
-            picked = 0
-            # Iterate until we've collected all payload fields, skipping reserved coords
-            # (Cap the loop to a safe upper bound to avoid infinite loops in weird edge cases.)
-            safety_cap = N * 3
+            i = 0; picked = 0; safety_cap = N * 3
             while picked < payload_fields and i < safety_cap:
-                f, y, x, c = prp_coord_at(i)
-                i += 1
-                if (f, y, x, c) in reserved:
-                    continue
-                chosen_positions.setdefault(f, []).append((y, x, c))
-                picked += 1
-
+                f, y, x, c = prp_coord_at(i); i += 1
+                if (f, y, x, c) in reserved: continue
+                chosen_positions.setdefault(f, []).append((y, x, c)); picked += 1
             if picked < payload_fields:
                 raise ValueError("Internal error: could not place all payload fields without colliding with header.")
 
-            groups = bit_chunks(embed_bytes, lsb)     # MSB-first groups of size <= lsb
+            groups = bit_chunks(embed_bytes, lsb)
             kbit_byte = K_bit[0]
             mask = (1 << lsb) - 1; invmask = 0xFF ^ mask
 
-            # Open writer: lossless master (FFV1 MKV via PNG sequence)
+            # Writer: FFV1 MKV via PNG seq
             stem = str(Path(self.reader.path).with_suffix(""))
             writer, out_path, codec_used = open_writer_like(self.reader, stem)
             self._log(f"Writer codec: {codec_used}")
 
-            # Write frames
             for fidx in range(self.reader.frames):
-                frame_rgb = self.reader.get_frame(fidx)  # RGB
-
-                # Header sequential on the first selected frame (GREEN channel)
+                frame_rgb = self.reader.get_frame(fidx)
                 if fidx == start_f:
                     embed_header_on_frame(frame_rgb, header, lsb, roi)
-
-                # Payload via PRP across frames/channels (excluding reserved spots)
                 if fidx in chosen_positions:
                     for (yy, xx, cc) in chosen_positions[fidx]:
                         try:
@@ -945,18 +1002,17 @@ class VideoEncodePage(QWidget):
                         v = rotate_left_bits(bits, lsb, kbit_byte)
                         base = frame_rgb[yy, xx, cc] & invmask
                         frame_rgb[yy, xx, cc] = np.uint8(base | v)
-
                 writer.write(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
             writer.release()
 
-            # OPTIONAL: create a lossy "view" MP4 copy for humans
+            # Create a lossy "view" copy (for humans only)
             try:
                 view_path = make_view_mp4(out_path)
                 self._log(f"View copy (lossy, do NOT decode): {view_path}")
             except Exception as e:
                 self._log(f"[WARN] Could not create view MP4: {e}")
 
-            # Self-check header from the lossless MKV
+            # Self-check
             try:
                 vr = VideoReader(out_path)
                 img0 = vr.get_frame(start_f)
@@ -966,6 +1022,26 @@ class VideoEncodePage(QWidget):
                 vr.close()
             except Exception as e:
                 self._log(f"[WARN] Self-check failed: {e}")
+
+            # NEW: write .meta next to the lossless MKV
+            try:
+                write_sidecar_meta(
+                    stego_path=Path(out_path),
+                    cover_path=self.reader.path,
+                    method="video_lsb",
+                    fps=self.reader.fps,
+                    width=self.reader.w,
+                    height=self.reader.h,
+                    lsb=lsb,
+                    roi=roi,
+                    frames=(start_f, length_f, step),
+                    token=token,
+                    payload_name=(orig_name if not is_text else None),
+                    payload_mode=(0 if is_text else 1)
+                )
+                self._log(f"[Meta] Wrote: {Path(out_path).with_suffix('.meta')}")
+            except Exception as _e:
+                self._log(f"[WARN] Could not write meta: {_e}")
 
             self._show_frame(start_f)
             self.log.append(f"Header bytes={len(header)} salt16={salt16.hex()} bit_rot={kbit_byte % lsb}")
@@ -982,6 +1058,7 @@ class VideoEncodePage(QWidget):
 
         except Exception as e:
             QMessageBox.critical(self, "Encode error", str(e)); self.log.append(f"[ERROR] {e}")
+
 
 
 # -----------------------------------------------------------------------------#
@@ -1132,9 +1209,31 @@ class VideoDecodePage(QWidget):
             self.view.set_frame(img)
             self.log.append("Loaded stego video (lossless).")
 
+            # NEW: read sidecar meta & prefill UI
+            self._meta = read_sidecar_meta(Path(path))
+            if self._meta:
+                det = []
+                if self._meta.get("method"): det.append(f"method={self._meta['method']}")
+                if self._meta.get("lsb") is not None: det.append(f"lsb={self._meta['lsb']}")
+                if self._meta.get("roi"): det.append(f"roi={self._meta['roi']}")
+                if self._meta.get("frames"): det.append(f"frames={self._meta['frames']}")
+                if self._meta.get("fps") is not None: det.append(f"fps={self._meta['fps']:.3f}")
+                if self._meta.get("width") is not None and self._meta.get("height") is not None:
+                    det.append(f"size={self._meta['width']}x{self._meta['height']}")
+                cov_line = f"\nCover (from .meta): {self._meta.get('cover_path')}" if self._meta.get("cover_path") else ""
+                self.info.setText(self.info.text() + cov_line + ("\nMeta: " + ", ".join(det) if det else ""))
+
+                if self._meta.get("token") and not self.key_token.text().strip():
+                    self.key_token.setText(self._meta["token"])
+                self.log.append(f"[Meta] Loaded: {Path(path).with_suffix('.meta').name}")
+            else:
+                self._meta = None
+                self.log.append("[Meta] No sidecar found.")
+
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
             self.log.append(f"[ERROR] {e}")
+
 
 
     def _derive(self, token: str, user_key: str):
@@ -1239,7 +1338,6 @@ class VideoDecodePage(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Inspect error", str(e)); self.log.append(f"[ERROR] {e}")
 
-
     def on_decode(self):
         try:
             if not self.reader: raise ValueError("Load a stego video first.")
@@ -1270,26 +1368,24 @@ class VideoDecodePage(QWidget):
             base = Path(self.reader.path).stem
 
             if kind == "text":
-                # print the UTF-8 text to the log (and also save a txt for convenience if you want)
+                # print UTF-8 into the log only
                 try:
                     txt = body.decode("utf-8", errors="strict")
                 except UnicodeDecodeError:
-                    # If encode-time said "text" but it isn't valid UTF-8, just show hex preview and save .bin
                     hex_preview = body[:48].hex(" ")
                     self.log.append(f"[WARN] Text payload is not valid UTF-8. First bytes: {hex_preview} …")
                     out_path = OUTPUT_DIR / f"{base}_payload_{ts}.bin"
                     with open(out_path, "wb") as f: f.write(body)
                     QMessageBox.information(self, "Decode", f"Saved raw bytes to:\n{out_path}")
-                    return
-
-                self.log.append("---- TEXT PAYLOAD START ----")
-                self.log.append(txt)
-                self.log.append("---- TEXT PAYLOAD END ----")
-                QMessageBox.information(self, "Decode", "Text payload printed to the log.")
+                    # still proceed to compare dialog below
+                else:
+                    self.log.append("---- TEXT PAYLOAD START ----")
+                    self.log.append(txt)
+                    self.log.append("---- TEXT PAYLOAD END ----")
+                    QMessageBox.information(self, "Decode", "Text payload printed to the log.")
 
             elif kind == "file":
                 safe_name = _sanitize_filename(fname or "payload.bin")
-                # avoid clobbering existing file
                 out_path = OUTPUT_DIR / safe_name
                 if out_path.exists():
                     out_path = OUTPUT_DIR / f"{out_path.stem}_{ts}{out_path.suffix}"
@@ -1299,27 +1395,37 @@ class VideoDecodePage(QWidget):
                 QMessageBox.information(self, "Decode", f"File saved:\n{out_path}")
 
             else:
-                # Back-compat path (older stegos without envelope)
+                # legacy
                 try:
                     txt = payload_bytes.decode("utf-8")
                     self.log.append("---- TEXT PAYLOAD (legacy) ----")
                     self.log.append(txt)
                     self.log.append("---- END ----")
                     QMessageBox.information(self, "Decode", "Text payload (legacy) printed to the log.")
+                    body = payload_bytes  # for compare dialog below
                 except UnicodeDecodeError:
                     out_path = OUTPUT_DIR / f"{base}_payload_{ts}.bin"
                     with open(out_path, "wb") as f: f.write(payload_bytes)
                     self.log.append(f"Saved binary payload to: {out_path} ({len(payload_bytes)} bytes)")
                     QMessageBox.information(self, "Decode", f"Binary payload saved:\n{out_path}")
+                    body = payload_bytes
 
-            # Optional compare dialog
-            orig_path, _ = QFileDialog.getOpenFileName(self, "Select original/cover video (optional for comparison)")
-            if orig_path:
-                dlg = CompareDialog(orig_path, self.reader.path, payload_bytes, self)
+            # === NEW: Auto-open CompareDialog using cover from .meta if available ===
+            meta_cover = (self._meta.get("cover_path") if getattr(self, "_meta", None) else None)
+            cov = meta_cover if (meta_cover and os.path.isfile(meta_cover)) else None
+            if cov is None:
+                # fallback to ask, same as before
+                orig_path, _ = QFileDialog.getOpenFileName(self, "Select original/cover video (optional for comparison)")
+                if orig_path:
+                    cov = orig_path
+            if cov:
+                dlg = CompareDialog(cov, self.reader.path, body if kind != "text" else body, self)
+                # Note: CompareDialog prints textual payload in its own box as well; this is just a preview area.
                 dlg.exec()
 
         except Exception as e:
             QMessageBox.critical(self, "Decode error", str(e)); self.log.append(f"[ERROR] {e}")
+
 
 class VideoSuite(QWidget):
     def __init__(self, parent=None):
