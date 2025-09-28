@@ -664,102 +664,156 @@ class PayloadPanel(QWidget):
 
 class VideoEncodePage(QWidget):
     def __init__(self):
-        super().__init__()
-        self.reader=None; self.video_path=None; self.cur_frame=0
-        self.roi=(0,0,0,0)
+            super().__init__()
+            self.reader=None; self.video_path=None; self.cur_frame=0
+            self.roi=(0,0,0,0)
 
-        left = QVBoxLayout()
+            left = QVBoxLayout()
 
-        cov = QGroupBox("Cover Video (MP4, MKV, AVI, MOV)")
-        cv = QVBoxLayout()
-        self.drop = DropLabel("a video file", SUPPORTED_VIDEO_EXTS)
-        self.drop.fileDropped.connect(self.load_video)
-        self.info = QLabel("No video loaded"); self.info.setWordWrap(True)
-        cv.addWidget(self.drop); cv.addWidget(self.info); cov.setLayout(cv)
+            # --- Cover
+            cov = QGroupBox("Cover Video (MP4, MKV, AVI, MOV)")
+            cv = QVBoxLayout()
+            self.drop = DropLabel("a video file", SUPPORTED_VIDEO_EXTS)
+            self.drop.fileDropped.connect(self.load_video)
+            self.info = QLabel("No video loaded"); self.info.setWordWrap(True)
+            cv.addWidget(self.drop); cv.addWidget(self.info); cov.setLayout(cv)
 
-        pay = QGroupBox("Payload (Text or File)")
-        self.payload_panel = PayloadPanel(self._update_capacity)
-        pv = QVBoxLayout(); pv.addWidget(self.payload_panel); pay.setLayout(pv)
+            # --- Payload
+            pay = QGroupBox("Payload (Text or File)")
+            self.payload_panel = PayloadPanel(self._update_capacity)
+            pv = QVBoxLayout(); pv.addWidget(self.payload_panel); pay.setLayout(pv)
 
-        ctrl = QGroupBox("Embedding Controls")
-        form = QFormLayout()
-        self.lsb = QSlider(Qt.Horizontal); self.lsb.setRange(1,4); self.lsb.setValue(1)
-        self.lsb_val = QLabel("1")
-        self.lsb.valueChanged.connect(lambda v: self.lsb_val.setText(str(v)))
-        self.lsb.valueChanged.connect(self._update_capacity)
-        lrow = QHBoxLayout(); lrow.addWidget(self.lsb,1); lrow.addWidget(self.lsb_val,0)
-        w_lsb = QWidget(); w_lsb.setLayout(lrow)
+            # --- Embedding Controls (compact 2-column grid)
+            ctrl = QGroupBox("Embedding Controls")
+            grid = QtWidgets.QGridLayout()
+            grid.setHorizontalSpacing(12)
+            grid.setVerticalSpacing(6)
+            grid.setColumnStretch(1, 1)
+            grid.setColumnStretch(3, 1)
 
-        self.key = QLineEdit(); self.key.setPlaceholderText("Enter key / passphrase (required)")
+            # LSB slider
+            self.lsb = QSlider(Qt.Horizontal); self.lsb.setRange(1,4); self.lsb.setValue(1)
+            self.lsb_val = QLabel("1")
+            self.lsb.valueChanged.connect(lambda v: self.lsb_val.setText(str(v)))
+            self.lsb.valueChanged.connect(self._update_capacity)
+            lrow = QHBoxLayout(); lrow.addWidget(self.lsb,1); lrow.addWidget(self.lsb_val,0)
+            lsb_wrap = QWidget(); lsb_wrap.setLayout(lrow)
 
-        self.start_frame = QSpinBox(); self.start_frame.setRange(0,0)
-        self.len_frames  = QSpinBox();  self.len_frames.setRange(1,1)
-        self.frame_step  = QSpinBox();  self.frame_step.setRange(1, 999_999); self.frame_step.setValue(1)
-        self.start_frame.valueChanged.connect(self._start_frame_changed)
-        self.len_frames.valueChanged.connect(self._update_capacity)
-        self.frame_step.valueChanged.connect(self._update_capacity)
+            # Key
+            self.key = QLineEdit(); self.key.setPlaceholderText("Enter key / passphrase (required)")
 
-        self.start_sec = QDoubleSpinBox(); self.start_sec.setDecimals(3); self.start_sec.setRange(0.0,0.0); self.start_sec.setSingleStep(0.010); self.start_sec.setSuffix(" s")
-        self.len_sec   = QDoubleSpinBox(); self.len_sec.setDecimals(3);   self.len_sec.setRange(0.001,0.001); self.len_sec.setSingleStep(0.010); self.len_sec.setSuffix(" s")
-        self.start_sec.valueChanged.connect(self._start_sec_changed)
-        self.len_sec.valueChanged.connect(self._len_sec_changed)
+            # integer spin boxes
+            self.start_frame = QSpinBox(); self.start_frame.setRange(0,0)
+            self.len_frames  = QSpinBox();  self.len_frames.setRange(1,1)
+            self.frame_step  = QSpinBox();  self.frame_step.setRange(1, 999_999); self.frame_step.setValue(1)
+            self.start_frame.valueChanged.connect(self._start_frame_changed)
+            self.len_frames.valueChanged.connect(self._update_capacity)
+            self.frame_step.valueChanged.connect(self._update_capacity)
 
-        form.addRow("Number of LSBs:", w_lsb)
-        form.addRow("Key:", self.key)
-        form.addRow("Start frame:", self.start_frame); form.addRow("Length (frames):", self.len_frames)
-        form.addRow("Frame step:", self.frame_step)
-        form.addRow("Start (seconds):", self.start_sec); form.addRow("Length (seconds):", self.len_sec)
-        ctrl.setLayout(form)
+            # second spin boxes
+            self.start_sec = QDoubleSpinBox(); self.start_sec.setDecimals(3); self.start_sec.setRange(0.0,0.0)
+            self.start_sec.setSingleStep(0.010); self.start_sec.setSuffix(" s")
+            self.len_sec   = QDoubleSpinBox(); self.len_sec.setDecimals(3);   self.len_sec.setRange(0.001,0.001)
+            self.len_sec.setSingleStep(0.010); self.len_sec.setSuffix(" s")
+            self.start_sec.valueChanged.connect(self._start_sec_changed)
+            self.len_sec.valueChanged.connect(self._len_sec_changed)
 
-        ts = QGroupBox("Timestamp (slide to choose start)")
-        tsv = QVBoxLayout()
-        row = QHBoxLayout()
-        self.t_left = QLabel("0:00"); self.t_cur = QLabel("0:00"); self.t_right = QLabel("0:00")
-        self.t_cur.setAlignment(Qt.AlignCenter); self.t_cur.setStyleSheet("font-weight:600;")
-        row.addWidget(self.t_left); row.addWidget(self.t_cur,1); row.addWidget(self.t_right)
-        tsv.addLayout(row)
-        self.slider = QSlider(Qt.Horizontal); self.slider.setRange(0,0); self.slider.setSingleStep(1); self.slider.setPageStep(30)
-        self.slider.valueChanged.connect(self._on_scrub)
-        tsv.addWidget(self.slider); ts.setLayout(tsv)
+            # grid layout — two columns of label/control pairs
+            # row 0
+            grid.addWidget(QLabel("Number of LSBs:"), 0, 0, alignment=Qt.AlignRight)
+            grid.addWidget(lsb_wrap,                 0, 1)
+            grid.addWidget(QLabel("Key:"),           0, 2, alignment=Qt.AlignRight)
+            grid.addWidget(self.key,                 0, 3)
+            # row 1
+            grid.addWidget(QLabel("Start frame:"),   1, 0, alignment=Qt.AlignRight)
+            grid.addWidget(self.start_frame,         1, 1)
+            grid.addWidget(QLabel("Length (frames):"), 1, 2, alignment=Qt.AlignRight)
+            grid.addWidget(self.len_frames,          1, 3)
+            # row 2
+            grid.addWidget(QLabel("Frame step:"),    2, 0, alignment=Qt.AlignRight)
+            grid.addWidget(self.frame_step,          2, 1)
+            # (leave the right half empty to keep it compact)
+            # row 3
+            grid.addWidget(QLabel("Start (seconds):"), 3, 0, alignment=Qt.AlignRight)
+            grid.addWidget(self.start_sec,             3, 1)
+            grid.addWidget(QLabel("Length (seconds):"),3, 2, alignment=Qt.AlignRight)
+            grid.addWidget(self.len_sec,               3, 3)
 
-        roi_box = QGroupBox("Selected ROI")
-        rv = QVBoxLayout()
-        self.roi_label = QLabel("ROI: (x=0, y=0, w=0, h=0)")
-        self.roi_thumb = QLabel(); self.roi_thumb.setFixedSize(240, 150); self.roi_thumb.setStyleSheet("background:#222; border:1px solid #444;"); self.roi_thumb.setAlignment(Qt.AlignCenter)
-        rv.addWidget(self.roi_label); rv.addWidget(self.roi_thumb); roi_box.setLayout(rv)
+            ctrl.setLayout(grid)
 
-        cap = QGroupBox("Capacity")
-        self.cap_label = QLabel("Load video + select ROI + add payload."); self.cap_label.setWordWrap(True)
-        capv = QVBoxLayout(); capv.addWidget(self.cap_label); cap.setLayout(capv)
+            # --- Timestamp scrubber
+            ts = QGroupBox("Timestamp (slide to choose start)")
+            tsv = QVBoxLayout()
+            row = QHBoxLayout()
+            self.t_left = QLabel("0:00"); self.t_cur = QLabel("0:00"); self.t_right = QLabel("0:00")
+            self.t_cur.setAlignment(Qt.AlignCenter); self.t_cur.setStyleSheet("font-weight:600;")
+            row.addWidget(self.t_left); row.addWidget(self.t_cur,1); row.addWidget(self.t_right)
+            tsv.addLayout(row)
+            self.slider = QSlider(Qt.Horizontal); self.slider.setRange(0,0); self.slider.setSingleStep(1); self.slider.setPageStep(30)
+            self.slider.valueChanged.connect(self._on_scrub)
+            tsv.addWidget(self.slider); ts.setLayout(tsv)
 
-        keybox = QGroupBox("Final Key (copy for decoding)")
-        keyh = QHBoxLayout()
-        self.key_token = QLineEdit(); self.key_token.setReadOnly(True)
-        self.btn_copy = QPushButton("Copy"); self.btn_copy.clicked.connect(lambda: (QtGui.QGuiApplication.clipboard().setText(self.key_token.text()), QMessageBox.information(self,"Copied","Final Key copied.")))
-        keyh.addWidget(self.key_token); keyh.addWidget(self.btn_copy); keybox.setLayout(keyh)
+            # --- Selected ROI (left)  +  Capacity (right)
+            roi_box = QGroupBox("Selected ROI")
+            rv = QVBoxLayout()
+            self.roi_label = QLabel("ROI: (x=0, y=0, w=0, h=0)")
+            self.roi_thumb = QLabel(); self.roi_thumb.setFixedSize(240, 150)
+            self.roi_thumb.setStyleSheet("background:#222; border:1px solid #444;")
+            self.roi_thumb.setAlignment(Qt.AlignCenter)
+            rv.addWidget(self.roi_label); rv.addWidget(self.roi_thumb)
+            roi_box.setLayout(rv)
 
-        self.btn_encode = QPushButton("Encode"); self.btn_encode.clicked.connect(self.on_encode)
+            cap_box = QGroupBox("Capacity")
+            self.cap_label = QLabel("Load video + select ROI + add payload.")
+            self.cap_label.setWordWrap(True)
+            capv = QVBoxLayout(); capv.addWidget(self.cap_label); cap_box.setLayout(capv)
 
-        left.addWidget(cov); left.addWidget(pay); left.addWidget(ctrl); left.addWidget(ts); left.addWidget(roi_box); left.addWidget(cap); left.addWidget(keybox); left.addWidget(self.btn_encode); left.addStretch(1)
+            roi_cap_row = QHBoxLayout()
+            roi_cap_row.addWidget(roi_box, 1)
+            roi_cap_row.addWidget(cap_box, 1)
 
-        # Right
-        right = QVBoxLayout()
-        vbox = QGroupBox("Video (drag to select ROI)")
-        vv = QVBoxLayout()
-        self.frame_view = FrameView(); self.frame_view.roiChanged.connect(self._on_roi)
-        vv.addWidget(self.frame_view); vbox.setLayout(vv)
+            # --- Final Key
+            keybox = QGroupBox("Final Key (copy for decoding)")
+            keyh = QHBoxLayout()
+            self.key_token = QLineEdit(); self.key_token.setReadOnly(True)
+            self.btn_copy = QPushButton("Copy")
+            self.btn_copy.clicked.connect(lambda: (QtGui.QGuiApplication.clipboard().setText(self.key_token.text()),
+                                                QMessageBox.information(self,"Copied","Final Key copied.")))
+            keyh.addWidget(self.key_token); keyh.addWidget(self.btn_copy); keybox.setLayout(keyh)
 
-        log_box = QGroupBox("Log")
-        self.log = QTextEdit(); self.log.setReadOnly(True)
-        lv = QVBoxLayout(); lv.addWidget(self.log); log_box.setLayout(lv)
+            # --- Encode button
+            self.btn_encode = QPushButton("Encode")
+            self.btn_encode.clicked.connect(self.on_encode)
 
-        right.addWidget(vbox); right.addWidget(log_box)
+            # LEFT column assembly (now much shorter vertically)
+            left.addWidget(cov)
+            left.addWidget(pay)
+            left.addWidget(ctrl)
+            left.addWidget(ts)
+            left.addLayout(roi_cap_row)      # <-- ROI + Capacity side-by-side
+            left.addWidget(keybox)
+            left.addWidget(self.btn_encode)
+            left.addStretch(1)
 
-        splitter = QSplitter()
-        lw = QWidget(); lw.setLayout(left)
-        rw = QWidget(); rw.setLayout(right)
-        splitter.addWidget(lw); splitter.addWidget(rw); splitter.setSizes([560, 720])
-        root = QVBoxLayout(self); root.addWidget(splitter)
+            # RIGHT column (unchanged)
+            right = QVBoxLayout()
+            vbox = QGroupBox("Video (drag to select ROI)")
+            vv = QVBoxLayout()
+            self.frame_view = FrameView(); self.frame_view.roiChanged.connect(self._on_roi)
+            vv.addWidget(self.frame_view); vbox.setLayout(vv)
+
+            log_box = QGroupBox("Log")
+            self.log = QTextEdit(); self.log.setReadOnly(True)
+            lv = QVBoxLayout(); lv.addWidget(self.log); log_box.setLayout(lv)
+
+            right.addWidget(vbox); right.addWidget(log_box)
+
+            splitter = QSplitter()
+            lw = QWidget(); lw.setLayout(left)
+            rw = QWidget(); rw.setLayout(right)
+            splitter.addWidget(lw); splitter.addWidget(rw); splitter.setSizes([560, 720])
+
+            root = QVBoxLayout(self); root.addWidget(splitter)
 
     # ---- helpers
     def load_video(self, path: str):
