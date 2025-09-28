@@ -30,6 +30,8 @@ from PySide6.QtWidgets import (
     QMessageBox, QTextEdit, QSlider, QSpinBox, QDoubleSpinBox, QFileDialog,
     QRubberBand, QComboBox, QCheckBox, QDialog
 )
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+
 
 # -----------------------------------------------------------------------------#
 APP_ROOT = Path.cwd()
@@ -1064,69 +1066,255 @@ class VideoEncodePage(QWidget):
 # -----------------------------------------------------------------------------#
 # Compare dialog (optional after decode)
 class CompareDialog(QDialog):
+    """
+    Side-by-side visual compare with a single timestamp slider + audio preview.
+    - Left: cover video frames (no audio)
+    - Right: stego video frames (no audio)
+    - Audio: plays from the stego *_view.mp4 (created by make_view_mp4) if present,
+             otherwise tries the stego file directly (may not play if it's FFV1/MKV).
+    - Controls: Play/Pause, Slider, Time label, Volume, Mute, Speed (0.25x..4x).
+    """
     def __init__(self, left_path: str, right_path: str, payload_bytes: bytes, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Compare: Original vs Stego")
+        self.setWindowTitle("Compare: Cover vs Stego")
         self.left = VideoReader(left_path)
         self.right = VideoReader(right_path)
-        self.timer = QtCore.QTimer(self); self.timer.timeout.connect(self._tick)
-        self.playing = True
+        self.payload = payload_bytes
 
+        # ---- UI
         top = QHBoxLayout()
-        def mk_panel(title):
+        def _panel(title):
             g = QGroupBox(title); v = QVBoxLayout()
-            view = FrameView(); v.addWidget(view); g.setLayout(v); return g, view
-        gL, self.viewL = mk_panel("Original"); gR, self.viewR = mk_panel("Stego")
+            view = FrameView(); v.addWidget(view); g.setLayout(v)
+            return g, view
+        gL, self.viewL = _panel("Cover")
+        gR, self.viewR = _panel("Stego")
         top.addWidget(gL); top.addWidget(gR)
 
-        ctrl = QHBoxLayout()
-        self.btn_play = QPushButton("Pause"); self.btn_play.clicked.connect(self._toggle)
-        self.btn_close = QPushButton("Close"); self.btn_close.clicked.connect(self.accept)
-        ctrl.addWidget(self.btn_play); ctrl.addStretch(1); ctrl.addWidget(self.btn_close)
+        # Controls row: play/pause, slider, timestamp, volume, mute, speed
+        controls = QHBoxLayout()
+        self.btn_play = QPushButton("Play")
+        self.btn_play.clicked.connect(self._toggle_play)
 
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, max(self.right.frames - 1, 0))
+        self.slider.sliderPressed.connect(self._pause_for_scrub)
+        self.slider.sliderMoved.connect(self._scrub_to)
+        self.slider.sliderReleased.connect(self._resume_after_scrub)
+
+        self.lbl_time = QLabel("0:00 / 0:00")
+        self.lbl_time.setMinimumWidth(120)
+
+        self.vol = QSlider(Qt.Horizontal)
+        self.vol.setRange(0, 100); self.vol.setValue(80)
+        lbl_vol = QLabel("Vol")
+
+        self.btn_mute = QPushButton("Mute")
+        self.btn_mute.setToolTip("Toggle mute (shortcut: M)")
+        try:
+            self.btn_mute.setShortcut(QtGui.QKeySequence("M"))
+        except Exception:
+            pass
+        self.btn_mute.clicked.connect(self._toggle_mute)
+
+        # --- Speed control
+        self.rate_combo = QComboBox()
+        self._rate_map = {
+            "0.25×": 0.25, "0.5×": 0.5, "1×": 1.0, "1.5×": 1.5, "2×": 2.0, "4×": 4.0
+        }
+        for label in self._rate_map.keys():
+            self.rate_combo.addItem(label)
+        self.rate_combo.setCurrentText("1×")
+        self.rate_combo.currentTextChanged.connect(self._on_rate_changed)
+        lbl_speed = QLabel("Speed")
+
+        controls.addWidget(self.btn_play)
+        controls.addWidget(self.slider, 1)
+        controls.addWidget(self.lbl_time)
+        controls.addSpacing(8)
+        controls.addWidget(lbl_vol)
+        controls.addWidget(self.vol)
+        controls.addWidget(self.btn_mute)
+        controls.addSpacing(12)
+        controls.addWidget(lbl_speed)
+        controls.addWidget(self.rate_combo)
+        controls.addStretch(1)
+
+        # Payload box
         pay = QGroupBox("Recovered Payload")
         pv = QVBoxLayout()
-        self.payload_info = QLabel(f"Size: {len(payload_bytes)} bytes")
+        self.payload_info = QLabel(f"Size: {len(self.payload)} bytes")
         self.payload_view = QTextEdit(); self.payload_view.setReadOnly(True)
         self.btn_save = QPushButton("Save payload as…")
-        self.btn_save.clicked.connect(lambda: self._save_payload(payload_bytes))
+        self.btn_save.clicked.connect(self._save_payload)
         try:
-            txt = payload_bytes.decode("utf-8")
+            txt = self.payload.decode("utf-8")
             self.payload_view.setPlainText(txt)
         except UnicodeDecodeError:
             self.payload_view.setPlainText("(Binary payload – preview not available)")
         pv.addWidget(self.payload_info); pv.addWidget(self.payload_view); pv.addWidget(self.btn_save)
         pay.setLayout(pv)
 
+        # Layout root
         root = QVBoxLayout(self)
-        root.addLayout(top); root.addLayout(ctrl); root.addWidget(pay)
-        self.resize(1200, 800)
+        root.addLayout(top)
+        root.addLayout(controls)
+        root.addWidget(pay)
+        self.resize(1200, 820)
 
-        self.idx = 0
-        self.timer.start(int(1000.0/ (self.right.fps or 25.0)))
-        self._show()
+        # ---- timers & state
+        self._playing = False
+        self._user_scrubbing = False
+        self._idx = 0
+        self._rate = 1.0
+        self._timer = QtCore.QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._rearm_timer()
 
-    def _show(self):
-        fL = self.left.get_frame(min(self.idx, self.left.frames-1))
-        fR = self.right.get_frame(min(self.idx, self.right.frames-1))
+        # ---- media audio setup
+        self._player = QMediaPlayer(self)
+        self._audio = QAudioOutput(self)
+        self._player.setAudioOutput(self._audio)
+        self.vol.valueChanged.connect(lambda v: self._audio.setVolume(max(0.0, min(1.0, v/100.0))))
+        self._audio.setVolume(0.8)
+        self._muted = False
+
+        audio_source = self._pick_audio_source(right_path)
+        if audio_source:
+            self._player.setSource(QtCore.QUrl.fromLocalFile(audio_source))
+            # apply current playback rate to audio as well
+            try:
+                self._player.setPlaybackRate(self._rate)
+            except Exception:
+                pass
+            self._set_muted(False)
+        else:
+            # If no playable audio, disable volume/mute/speed still works visually
+            self.vol.setEnabled(False)
+            self.btn_mute.setEnabled(False)
+
+        # initial draw
+        self._show_index(0)
+        self._update_time_label()
+
+    # ---------- helpers
+    def _pick_audio_source(self, stego_path: str) -> str | None:
+        p = Path(stego_path)
+        cand = str(p.with_suffix("")) + "_view.mp4"  # created by make_view_mp4()
+        if os.path.isfile(cand):
+            return cand
+        return stego_path if os.path.isfile(stego_path) else None
+
+    def _frames_to_ms(self, idx: int) -> int:
+        fps = self.right.fps or 25.0
+        return int((idx / fps) * 1000.0)
+
+    def _ms_to_frame(self, ms: int) -> int:
+        fps = self.right.fps or 25.0
+        idx = int((ms / 1000.0) * fps)
+        return max(0, min(idx, max(self.right.frames - 1, 0)))
+
+    def _update_time_label(self):
+        cur = fmt_time(self._idx, self.right.fps or 25.0)
+        total = fmt_time(self.right.frames, self.right.fps or 25.0)
+        self.lbl_time.setText(f"{cur} / {total}")
+
+    def _show_index(self, idx: int):
+        self._idx = max(0, min(idx, max(self.right.frames - 1, 0)))
+        fL = self.left.get_frame(min(self._idx, self.left.frames - 1))
+        fR = self.right.get_frame(min(self._idx, self.right.frames - 1))
         if fL is not None: self.viewL.set_frame(fL)
         if fR is not None: self.viewR.set_frame(fR)
+        if not self._user_scrubbing:
+            self.slider.blockSignals(True)
+            self.slider.setValue(self._idx)
+            self.slider.blockSignals(False)
+            try:
+                self._player.setPosition(self._frames_to_ms(self._idx))
+            except Exception:
+                pass
+        self._update_time_label()
 
-    def _toggle(self):
-        self.playing = not self.playing
-        self.btn_play.setText("Pause" if self.playing else "Play")
+    # ---------- playback + scrubbing
+    def _toggle_play(self):
+        self._playing = not self._playing
+        self.btn_play.setText("Pause" if self._playing else "Play")
+        try:
+            if self._playing:
+                self._player.play()
+            else:
+                self._player.pause()
+        except Exception:
+            pass
+
+    def _pause_for_scrub(self):
+        self._user_scrubbing = True
+        was_playing = self._playing
+        self._playing = False
+        self.btn_play.setText("Play")
+        try:
+            self._player.pause()
+        except Exception:
+            pass
+        self._resume_after_scrub_should_play = was_playing
+
+    def _scrub_to(self, idx: int):
+        self._show_index(idx)
+
+    def _resume_after_scrub(self):
+        self._user_scrubbing = False
+        if getattr(self, "_resume_after_scrub_should_play", False):
+            self._playing = True
+            self.btn_play.setText("Pause")
+            try:
+                self._player.play()
+            except Exception:
+                pass
 
     def _tick(self):
-        if not self.playing: return
-        self.idx += 1
-        if self.idx >= max(self.left.frames, self.right.frames): self.idx = 0
-        self._show()
+        if not self._playing:
+            return
+        step = max(1, int(round(self._rate))) if self._rate >= 1.0 else 1
+        nxt = self._idx + step
+        if nxt >= max(self.left.frames, self.right.frames):
+            nxt = 0
+        self._show_index(nxt)
 
-    def _save_payload(self, data: bytes):
+    # ---------- mute + speed
+    def _toggle_mute(self):
+        self._set_muted((not self._muted) if hasattr(self, "_muted") else True)
+
+    def _set_muted(self, state: bool):
+        self._muted = bool(state)
+        try:
+            self._audio.setMuted(self._muted)
+        except Exception:
+            pass
+        self.btn_mute.setText("Unmute" if self._muted else "Mute")
+
+    def _on_rate_changed(self, label: str):
+        self._rate = float(self._rate_map.get(label, 1.0))
+        # adjust frame clock
+        self._rearm_timer()
+        # adjust audio playback rate (if supported)
+        try:
+            self._player.setPlaybackRate(self._rate)
+        except Exception:
+            pass
+
+    def _rearm_timer(self):
+        base_fps = self.right.fps or 25.0
+        eff_fps = max(0.1, base_fps * self._rate)  # avoid <= 0
+        interval_ms = int(1000.0 / eff_fps)
+        self._timer.start(max(1, interval_ms))
+
+    # ---------- payload save
+    def _save_payload(self):
         ts = time.strftime("%Y%m%d-%H%M%S")
         path = OUTPUT_DIR / f"payload_{ts}.bin"
-        with open(path, "wb") as f: f.write(data)
-        QMessageBox.information(self, "Saved", f"Wrote {len(data)} bytes to:\n{path}")
+        with open(path, "wb") as f:
+            f.write(self.payload)
+        QMessageBox.information(self, "Saved", f"Wrote {len(self.payload)} bytes to:\n{path}")
 
 # -----------------------------------------------------------------------------#
 # Decode page — full implementation using token + key
@@ -1223,8 +1411,6 @@ class VideoDecodePage(QWidget):
                 cov_line = f"\nCover (from .meta): {self._meta.get('cover_path')}" if self._meta.get("cover_path") else ""
                 self.info.setText(self.info.text() + cov_line + ("\nMeta: " + ", ".join(det) if det else ""))
 
-                if self._meta.get("token") and not self.key_token.text().strip():
-                    self.key_token.setText(self._meta["token"])
                 self.log.append(f"[Meta] Loaded: {Path(path).with_suffix('.meta').name}")
             else:
                 self._meta = None
