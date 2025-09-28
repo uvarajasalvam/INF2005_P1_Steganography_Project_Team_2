@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QLineEdit, QFormLayout, QTabWidget, QSplitter,
     QMessageBox, QTextEdit, QSlider, QSpinBox, QDoubleSpinBox, QCheckBox
 )
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 from pydub import AudioSegment
 from pydub.utils import which as which_ffmpeg
@@ -571,6 +572,116 @@ def mp3_unwrap_payload(buf: bytes) -> tuple[dict, bytes] | None:
     payload = buf[off:end]
     return meta, payload
 
+class AudioPlayer(QtWidgets.QWidget):
+    """
+    Simple audio player: play/pause, stop, seek, volume.
+    Use load(path) to set a file. Works for WAV/MP3/FLAC/OGG.
+    """
+    def __init__(self, title: str = "Player", parent=None):
+        super().__init__(parent)
+        self._path = None
+        self.player = QMediaPlayer(self)
+        self.audio = QAudioOutput(self)
+        self.player.setAudioOutput(self.audio)
+
+        title_lbl = QLabel(title)
+        title_lbl.setStyleSheet("font-weight:600;")
+
+        self.btn_play = QPushButton("Play")
+        self.btn_stop = QPushButton("Stop")
+        self.btn_play.setEnabled(False)
+        self.btn_stop.setEnabled(False)
+
+        self.pos = QSlider(Qt.Horizontal)
+        self.pos.setRange(0, 0); self.pos.setEnabled(False)
+
+        self.lbl_time = QLabel("0:00 / 0:00")
+        self.lbl_time.setMinimumWidth(100)
+
+        self.vol = QSlider(Qt.Horizontal)
+        self.vol.setRange(0, 100); self.vol.setValue(80)
+        self.audio.setVolume(0.8)
+
+        top = QHBoxLayout()
+        top.addWidget(title_lbl)
+        top.addStretch(1)
+
+        row = QHBoxLayout()
+        row.addWidget(self.btn_play)
+        row.addWidget(self.btn_stop)
+        row.addWidget(self.pos, 1)
+        row.addWidget(self.lbl_time)
+        row.addWidget(QLabel("Vol"))
+        row.addWidget(self.vol)
+
+        lay = QVBoxLayout(self)
+        lay.addLayout(top)
+        lay.addLayout(row)
+
+        # signals
+        self.btn_play.clicked.connect(self._toggle_play)
+        self.btn_stop.clicked.connect(self._stop)
+        self.pos.sliderMoved.connect(self._seek)
+        self.vol.valueChanged.connect(self._set_volume)
+
+        self.player.positionChanged.connect(self._on_position)
+        self.player.durationChanged.connect(self._on_duration)
+        self.player.mediaStatusChanged.connect(self._on_status)
+        self.player.playbackStateChanged.connect(self._on_state)
+
+    def load(self, path: str):
+        if not path or not os.path.isfile(path):
+            self._path = None
+            self.btn_play.setEnabled(False)
+            self.btn_stop.setEnabled(False)
+            self.pos.setEnabled(False)
+            self.lbl_time.setText("0:00 / 0:00")
+            return
+        self._path = path
+        self.player.setSource(QtCore.QUrl.fromLocalFile(path))
+        self.btn_play.setEnabled(True)
+        self.btn_stop.setEnabled(True)
+        self.pos.setEnabled(True)
+        self.btn_play.setText("Play")
+
+    def _toggle_play(self):
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+        else:
+            self.player.play()
+
+    def _stop(self):
+        self.player.stop()
+
+    def _seek(self, ms: int):
+        self.player.setPosition(ms)
+
+    def _set_volume(self, v: int):
+        self.audio.setVolume(max(0.0, min(1.0, v/100.0)))
+
+    def _fmt(self, ms: int) -> str:
+        s = max(0, int(round(ms/1000)))
+        m, s = divmod(s, 60)
+        return f"{m}:{s:02d}"
+
+    def _on_position(self, ms: int):
+        self.pos.blockSignals(True)
+        self.pos.setValue(ms)
+        self.pos.blockSignals(False)
+        self.lbl_time.setText(f"{self._fmt(ms)} / {self._fmt(self.player.duration())}")
+
+    def _on_duration(self, ms: int):
+        self.pos.setRange(0, max(0, ms))
+        self.lbl_time.setText(f"{self._fmt(self.player.position())} / {self._fmt(ms)}")
+
+    def _on_status(self, st):
+        # you can log or show hints if needed
+        pass
+
+    def _on_state(self, st):
+        self.btn_play.setText("Pause" if st == QMediaPlayer.PlaybackState.PlayingState else "Play")
+
+
 # ----------------- AUDIO ENCODE TAB -----------------
 class AudioEncodeTab(QWidget):
     def __init__(self):
@@ -656,6 +767,8 @@ class AudioEncodeTab(QWidget):
         left.addWidget(cov_box); left.addWidget(pay_box); left.addWidget(ctrl)
         left.addWidget(mp3_box)  # new
         left.addWidget(ts_box)
+        self.player_encode = AudioPlayer("Cover audio")
+        left.addWidget(self.player_encode)
         left.addWidget(cap_box); left.addWidget(key_box); left.addLayout(btns); left.addStretch(1)
 
         right = QVBoxLayout()
@@ -801,6 +914,7 @@ class AudioEncodeTab(QWidget):
             mono = pcm.samples_i16 if pcm.samples_i16.ndim == 1 else pcm.samples_i16[:,0]
             self.wave.set_audio(mono, pcm.rate); self.wave.set_selection(self.audio_start.value(), self.audio_len.value())
             self.update_capacity_label()
+            self.player_encode.load(self.orig_cover_path)
 
             if pcm.is_lossy and not (self.is_mp3_cover and self.chk_use_mp3stego.isChecked()):
                 self.log("[WARN] Source is lossy (e.g., MP3). LSB payload won’t survive re-encoding. "
@@ -1044,6 +1158,8 @@ class AudioDecodeTab(QWidget):
         self.inspect_btn.clicked.connect(self.on_inspect); self.decode_btn.clicked.connect(self.on_decode)
         btns.addWidget(self.inspect_btn); btns.addWidget(self.decode_btn)
 
+        self.player_decode = AudioPlayer("Stego audio")
+        root.addWidget(self.player_decode)
         log_box = QGroupBox("Log"); self.log_edit = QTextEdit(); self.log_edit.setReadOnly(True)
         lv = QVBoxLayout(); lv.addWidget(self.log_edit); log_box.setLayout(lv)
 
@@ -1102,6 +1218,8 @@ class AudioDecodeTab(QWidget):
             else:
                 self.media_info.setText(f"Path: {path}")
             self.log(f"Loaded stego file: {path}")
+            self.player_decode.load(path)
+
         except Exception as e:
             self.error(str(e))
 
@@ -1359,6 +1477,32 @@ class AudioDecodePreview(QtWidgets.QDialog):
         tools.addWidget(self.btn_load_cover)
         main.addLayout(tools)
 
+        self.player_preview = AudioPlayer("Preview player", self)
+
+        self.btn_play_stego = QPushButton("Play stego")
+        self.btn_play_cover = QPushButton("Play cover")
+        self.btn_play_cover.setEnabled(bool(self.cover_path and os.path.isfile(str(self.cover_path))))
+
+        picker = QHBoxLayout()
+        picker.addWidget(self.btn_play_stego)
+        picker.addWidget(self.btn_play_cover)
+        picker.addStretch(1)
+        main.addLayout(picker)
+        main.addWidget(self.player_preview)
+
+        # Preload stego into player (so Play stego works immediately)
+        if self.stego_path and os.path.isfile(self.stego_path):
+            self.player_preview.load(self.stego_path)
+
+        # Wire buttons
+        self.btn_play_stego.clicked.connect(
+            lambda: (self.player_preview.load(self.stego_path), self.player_preview._toggle_play())
+        )
+        self.btn_play_cover.clicked.connect(
+            lambda: (self.cover_path and os.path.isfile(str(self.cover_path))) and
+                    (self.player_preview.load(self.cover_path), self.player_preview._toggle_play())
+        )
+
         # --- Bottom: payload preview
         payload_box = QGroupBox("Payload")
         pv = QVBoxLayout(payload_box)
@@ -1505,6 +1649,9 @@ class AudioDecodePreview(QtWidgets.QDialog):
             self.cover_path = f
             self._right["data"] = None
             self._load_audio()
+
+            if hasattr(self, "btn_play_cover"):
+                self.btn_play_cover.setEnabled(True)
 
     # ---------- Payload preview ----------
     def _looks_like_text(self, b: bytes) -> bool:
