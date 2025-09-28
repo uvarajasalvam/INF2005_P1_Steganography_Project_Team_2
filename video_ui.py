@@ -24,6 +24,8 @@ import tempfile, subprocess, shutil
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QGroupBox, QLineEdit, QFormLayout, QTabWidget, QSplitter,
@@ -660,6 +662,101 @@ class PayloadPanel(QWidget):
         except Exception as e:
             QMessageBox.critical(self,"Error",str(e))
 
+class VideoPlayer(QtWidgets.QGroupBox):
+    """
+    Simple video player widget: QMediaPlayer + QVideoWidget with
+    Play/Pause, Stop, position slider, time label, and volume.
+    """
+    def __init__(self, title: str = "Video Player", parent=None):
+        super().__init__(title, parent)
+
+        # Core multimedia objects
+        self.player = QMediaPlayer(self)
+        self.audio = QAudioOutput(self)
+        self.player.setAudioOutput(self.audio)
+
+        # UI
+        vbox = QtWidgets.QVBoxLayout(self)
+
+        self.video = QVideoWidget(self)
+        vbox.addWidget(self.video, 1)
+        self.player.setVideoOutput(self.video)
+
+        ctrl = QtWidgets.QHBoxLayout()
+        self.btn_play = QtWidgets.QPushButton("Play")
+        self.btn_stop = QtWidgets.QPushButton("Stop")
+        self.lbl_time = QtWidgets.QLabel("0:00 / 0:00")
+        self.lbl_time.setMinimumWidth(110)
+        ctrl.addWidget(self.btn_play)
+        ctrl.addWidget(self.btn_stop)
+        ctrl.addStretch(1)
+        ctrl.addWidget(self.lbl_time)
+
+        vbox.addLayout(ctrl)
+
+        self.slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.slider.setRange(0, 0)
+        vbox.addWidget(self.slider)
+
+        vol_row = QtWidgets.QHBoxLayout()
+        vol_row.addWidget(QtWidgets.QLabel("Vol"))
+        self.vol = QtWidgets.QSlider(Qt.Horizontal)
+        self.vol.setRange(0, 100)
+        self.vol.setValue(80)
+        vol_row.addWidget(self.vol)
+        vbox.addLayout(vol_row)
+
+        # Signals
+        self.btn_play.clicked.connect(self._toggle_play)
+        self.btn_stop.clicked.connect(self._stop)
+        self.slider.sliderMoved.connect(self._seek)
+        self.vol.valueChanged.connect(lambda v: self.audio.setVolume(max(0.0, min(1.0, v/100.0))))
+
+        self.player.positionChanged.connect(self._on_position)
+        self.player.durationChanged.connect(self._on_duration)
+        self.player.playbackStateChanged.connect(self._on_state)
+
+    # Public API
+    def load(self, path: str):
+        if not path or not os.path.isfile(path):
+            return
+        self.player.setSource(QtCore.QUrl.fromLocalFile(path))
+        self.btn_play.setText("Play")
+        self.slider.setValue(0)
+        self.lbl_time.setText("0:00 / 0:00")
+
+    # Slots/helpers
+    def _toggle_play(self):
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+        else:
+            self.player.play()
+
+    def _stop(self):
+        self.player.stop()
+        self.slider.setValue(0)
+
+    def _seek(self, ms: int):
+        self.player.setPosition(ms)
+
+    @staticmethod
+    def _fmt(ms: int) -> str:
+        s = max(0, int(round(ms/1000)))
+        m, s = divmod(s, 60)
+        return f"{m}:{s:02d}"
+
+    def _on_position(self, ms: int):
+        self.slider.blockSignals(True)
+        self.slider.setValue(ms)
+        self.slider.blockSignals(False)
+        self.lbl_time.setText(f"{self._fmt(ms)} / {self._fmt(self.player.duration())}")
+
+    def _on_duration(self, ms: int):
+        self.slider.setRange(0, max(0, ms))
+        self.lbl_time.setText(f"{self._fmt(self.player.position())} / {self._fmt(ms)}")
+
+    def _on_state(self, st):
+        self.btn_play.setText("Pause" if st == QMediaPlayer.PlaybackState.PlayingState else "Play")
 class VideoEncodePage(QWidget):
     def __init__(self):
         super().__init__()
@@ -739,6 +836,8 @@ class VideoEncodePage(QWidget):
         self.btn_encode = QPushButton("Encode"); self.btn_encode.clicked.connect(self.on_encode)
 
         left.addWidget(cov); left.addWidget(pay); left.addWidget(ctrl); left.addWidget(ts); left.addWidget(roi_box); left.addWidget(cap); left.addWidget(keybox); left.addWidget(self.btn_encode); left.addStretch(1)
+        self.preview_player = VideoPlayer("Preview player")
+        left.addWidget(self.preview_player)
 
         # Right
         right = QVBoxLayout()
@@ -765,6 +864,7 @@ class VideoEncodePage(QWidget):
             if Path(path).suffix.lower() not in SUPPORTED_VIDEO_EXTS: raise ValueError("Unsupported video format.")
             if self.reader: self.reader.close()
             self.reader = VideoReader(path); self.video_path = path
+            
 
             dur = self.reader.frames / self.reader.fps if self.reader.fps>0 else 0.0
             self.info.setText(f"Path: {path}\n{self.reader.w}x{self.reader.h} @ {self.reader.fps:.3f} fps, frames={self.reader.frames}, dur={dur:.2f}s")
@@ -790,6 +890,10 @@ class VideoEncodePage(QWidget):
             self._update_roi_preview()
             self._update_capacity()
             self.log.append("Loaded video.")
+
+            if hasattr(self, "preview_player"):
+                self.preview_player.load(path)
+                
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e)); self.log.append(f"[ERROR] {e}")
 
@@ -1168,7 +1272,9 @@ class VideoDecodePage(QWidget):
         self.log = QTextEdit(); self.log.setReadOnly(True)
         lv = QVBoxLayout(); lv.addWidget(self.log); log_box.setLayout(lv)
         right.addWidget(log_box)
-
+        self.preview_player = VideoPlayer("Preview player")
+        right.addWidget(self.preview_player)
+    
         splitter = QSplitter()
         lw = QWidget(); l = QVBoxLayout(lw); l.addLayout(left)
         rw = QWidget(); r = QVBoxLayout(rw); r.addLayout(right)
@@ -1181,6 +1287,7 @@ class VideoDecodePage(QWidget):
             ext = Path(path).suffix.lower()
             if ext not in SUPPORTED_VIDEO_EXTS:
                 raise ValueError("Unsupported video format.")
+            
 
             # Probe stream and refuse likely-lossy inputs (prevents 'Bad header magic')
             codec, pix = probe_stream(path)
@@ -1208,6 +1315,9 @@ class VideoDecodePage(QWidget):
             img = self.reader.get_frame(0)
             self.view.set_frame(img)
             self.log.append("Loaded stego video (lossless).")
+
+            if hasattr(self, "preview_player"):
+                self.preview_player.load(path)
 
             # NEW: read sidecar meta & prefill UI
             self._meta = read_sidecar_meta(Path(path))
